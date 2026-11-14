@@ -116,8 +116,7 @@ pub fn gemv_ptq1_0(
                 }
 
                 // Last 8 trits (2 bytes x 4 trits)
-                for qh_idx in 0..2 {
-                    let qh_byte = block.qh[qh_idx];
+                for (qh_idx, &qh_byte) in block.qh.iter().enumerate() {
                     let base_act = 120 + qh_idx * 4;
                     for t in 0..4 {
                         let code = (qh_byte >> (t * 2)) & 3;

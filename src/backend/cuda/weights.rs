@@ -10,6 +10,9 @@ pub struct CudaMatrix {
     pub size_bytes: usize,
     pub is_q4: bool,
     pub is_ternary: bool,
+    /// Ternary flavor: PTQ1_0 (28-byte/128-weight blocks) vs Q2_0 (10-byte/32-weight blocks).
+    /// The `gemv_ternary` PTX kernel is PTQ1_0-only; Q2_0 matrices need `gemv_q2_0`.
+    pub is_ptq1: bool,
 }
 
 pub struct CudaLayerWeights {
@@ -39,6 +42,7 @@ impl CudaModelWeights {
         let upload_matrix = |matrix: &crate::model::weights::QuantizedMatrix<'_>| -> Result<CudaMatrix, String> {
             let is_q4 = matrix.is_q4();
             let is_ternary = matrix.is_ternary();
+            let is_ptq1 = matches!(matrix, crate::model::weights::QuantizedMatrix::PTQ1(_));
             let raw_bytes = matrix.raw_bytes();
             let size_bytes = raw_bytes.len();
             let d_ptr = device.alloc(size_bytes)?;
@@ -51,6 +55,7 @@ impl CudaModelWeights {
                 size_bytes,
                 is_q4,
                 is_ternary,
+                is_ptq1,
             })
         };
 

@@ -110,6 +110,7 @@ pub struct CudaDevice {
     pub fn_argmax_f32: usize,
     pub fn_top64_sample: usize,
     pub fn_gemv_ternary: usize,
+    pub fn_gemv_q2_0: usize,
 }
 
 unsafe impl Send for CudaDevice {}
@@ -218,6 +219,13 @@ impl CudaDevice {
                 return None;
             }
 
+            let mut fn_gemv_q2_0 = 0usize;
+            let n_q2 = CString::new("gemv_q2_0").ok()?;
+            if (driver.cu_module_get_function)(&mut fn_gemv_q2_0, module, n_q2.as_ptr()) != 0 {
+                (driver.cu_ctx_destroy)(ctx);
+                return None;
+            }
+
             Some(Self {
                 driver,
                 ctx,
@@ -232,6 +240,7 @@ impl CudaDevice {
                 fn_argmax_f32,
                 fn_top64_sample,
                 fn_gemv_ternary,
+                fn_gemv_q2_0,
             })
         }
     }
@@ -705,6 +714,51 @@ impl CudaDevice {
 
         if res != 0 {
             Err(format!("cuLaunchKernel gemv_ternary failed: {res}"))
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn launch_gemv_q2_0(
+        &self,
+        d_weights: usize,
+        d_input: usize,
+        d_output: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let cols_u32 = cols as u32;
+        let rows_u32 = rows as u32;
+
+        let mut args: [*mut c_void; 5] = [
+            &d_weights as *const usize as *mut c_void,
+            &d_input as *const usize as *mut c_void,
+            &d_output as *const usize as *mut c_void,
+            &cols_u32 as *const u32 as *mut c_void,
+            &rows_u32 as *const u32 as *mut c_void,
+        ];
+
+        let warps_per_block = 4u32;
+        let grid_x = rows_u32.div_ceil(warps_per_block);
+
+        let res = unsafe {
+            (self.driver.cu_launch_kernel)(
+                self.fn_gemv_q2_0,
+                grid_x,
+                1,
+                1,
+                32,
+                warps_per_block,
+                1,
+                0,
+                0,
+                args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+
+        if res != 0 {
+            Err(format!("cuLaunchKernel gemv_q2_0 failed: {res}"))
         } else {
             Ok(())
         }

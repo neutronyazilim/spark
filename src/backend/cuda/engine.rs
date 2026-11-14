@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
-use super::{driver::CudaDevice, weights::CudaModelWeights};
+use super::{driver::CudaDevice, weights::{CudaMatrix, CudaModelWeights}};
 use crate::model::config::ModelConfig;
+use crate::model::ops;
 
 pub struct CudaEngine {
     pub device: Arc<CudaDevice>,
@@ -10,12 +11,15 @@ pub struct CudaEngine {
     pub d_qkv: usize,
     pub d_context: usize,
     pub d_ffn_out: usize,
+    pub d_ffn_up: usize,
     pub d_out: usize,
     pub d_logits: usize,
     pub d_token_out: usize,
     pub d_top64_tokens: usize,
     pub d_top64_logits: usize,
     pub h_qkv_buf: std::cell::UnsafeCell<Vec<f32>>,
+    pub h_ffn_gate: std::cell::UnsafeCell<Vec<f32>>,
+    pub h_ffn_up: std::cell::UnsafeCell<Vec<f32>>,
     pub h_top64_tokens: std::cell::UnsafeCell<[u32; 64]>,
     pub h_top64_logits: std::cell::UnsafeCell<[f32; 64]>,
     pub hidden_dim: usize,
@@ -75,6 +79,7 @@ impl CudaEngine {
         let d_qkv = device.alloc(max_qkv_rows * 4)?;
         let d_context = device.alloc(max_ctx_dim * 4)?;
         let d_ffn_out = device.alloc(max_intermediate * 4)?;
+        let d_ffn_up = device.alloc(max_intermediate * 4)?;
         let d_out = device.alloc(max_hidden * 4)?;
         let d_logits = device.alloc(max_vocab * 4)?;
         let d_token_out = device.alloc(4)?;
@@ -88,12 +93,15 @@ impl CudaEngine {
             d_qkv,
             d_context,
             d_ffn_out,
+            d_ffn_up,
             d_out,
             d_logits,
             d_token_out,
             d_top64_tokens,
             d_top64_logits,
             h_qkv_buf: std::cell::UnsafeCell::new(vec![0.0f32; max_qkv_rows]),
+            h_ffn_gate: std::cell::UnsafeCell::new(vec![0.0f32; max_intermediate]),
+            h_ffn_up: std::cell::UnsafeCell::new(vec![0.0f32; max_intermediate]),
             h_top64_tokens: std::cell::UnsafeCell::new([0u32; 64]),
             h_top64_logits: std::cell::UnsafeCell::new([0.0f32; 64]),
             hidden_dim: max_hidden,
@@ -103,6 +111,24 @@ impl CudaEngine {
             intermediate_dim: max_intermediate,
             vocab_size: max_vocab,
         })
+    }
+
+    /// Dispatch a single matrix GEMV on the device, picking the kernel that
+    /// matches the matrix's block layout. Ternary matrices come in two flavors:
+    /// PTQ1_0 (28-byte blocks of 128 weights) is handled by `gemv_ternary`,
+    /// while Q2_0 (10-byte blocks of 32 weights) needs `gemv_q2_0`.
+    fn launch_matrix(&self, m: &CudaMatrix, d_input: usize, d_output: usize) -> Result<(), String> {
+        if m.is_ternary {
+            if m.is_ptq1 {
+                self.device.launch_gemv_ternary(m.d_ptr, d_input, d_output, m.cols, m.rows)
+            } else {
+                self.device.launch_gemv_q2_0(m.d_ptr, d_input, d_output, m.cols, m.rows)
+            }
+        } else if m.is_q4 {
+            self.device.launch_gemv_q4(m.d_ptr, d_input, d_output, m.cols, m.rows)
+        } else {
+            self.device.launch_gemv_q8(m.d_ptr, d_input, d_output, m.cols, m.rows)
+        }
     }
 
     pub fn gemv_qkv(
@@ -120,24 +146,27 @@ impl CudaEngine {
         self.device.copy_to_device(self.d_norm, bytes_norm)?;
 
         if layer.q.is_ternary {
-            self.device.launch_gemv_ternary(layer.q.d_ptr, self.d_norm, self.d_qkv, layer.q.cols, layer.q.rows)?;
+            // Ternary path has no fused kernel: launch Q, K and V separately,
+            // writing each result at its offset inside d_qkv.
+            self.launch_matrix(&layer.q, self.d_norm, self.d_qkv)?;
+            self.launch_matrix(&layer.k, self.d_norm, self.d_qkv + layer.q.rows * 4)?;
+            self.launch_matrix(&layer.v, self.d_norm, self.d_qkv + (layer.q.rows + layer.k.rows) * 4)?;
+
+            let total_rows = layer.q.rows + layer.k.rows + layer.v.rows;
             let host_qkv = unsafe { &mut *self.h_qkv_buf.get() };
-            let copy_len = layer.q.rows.min(host_qkv.len());
+            let copy_len = total_rows.min(host_qkv.len());
             let bytes_qkv = unsafe {
                 std::slice::from_raw_parts_mut(host_qkv.as_mut_ptr().cast::<u8>(), copy_len * 4)
             };
             self.device.copy_from_device(bytes_qkv, self.d_qkv)?;
 
-            let q_len = h_q.len().min(copy_len);
+            let q_len = layer.q.rows.min(h_q.len());
             h_q[..q_len].copy_from_slice(&host_qkv[..q_len]);
-            let k_len = h_k.len().min(copy_len.saturating_sub(q_len));
-            if k_len > 0 {
-                h_k[..k_len].copy_from_slice(&host_qkv[q_len..q_len + k_len]);
-            }
-            let v_len = h_v.len().min(copy_len.saturating_sub(q_len + k_len));
-            if v_len > 0 {
-                h_v[..v_len].copy_from_slice(&host_qkv[q_len + k_len..q_len + k_len + v_len]);
-            }
+            let k_len = layer.k.rows.min(h_k.len());
+            h_k[..k_len].copy_from_slice(&host_qkv[layer.q.rows..layer.q.rows + k_len]);
+            let v_len = layer.v.rows.min(h_v.len());
+            h_v[..v_len]
+                .copy_from_slice(&host_qkv[layer.q.rows + layer.k.rows..layer.q.rows + layer.k.rows + v_len]);
         } else if layer.q.is_q4 {
             self.device.launch_fused_qkv_q4(
                 layer.q.d_ptr,
@@ -200,13 +229,7 @@ impl CudaEngine {
         self.device.copy_to_device(self.d_context, bytes_ctx)?;
 
         if layer.o.is_ternary {
-            self.device.launch_gemv_ternary(
-                layer.o.d_ptr,
-                self.d_context,
-                self.d_out,
-                layer.o.cols,
-                layer.o.rows,
-            )?;
+            self.launch_matrix(&layer.o, self.d_context, self.d_out)?;
         } else if layer.o.is_q4 {
             self.device.launch_gemv_q4(
                 layer.o.d_ptr,
@@ -247,20 +270,35 @@ impl CudaEngine {
         self.device.copy_to_device(self.d_norm, bytes_norm)?;
 
         if layer.gate.is_ternary {
-            self.device.launch_gemv_ternary(
-                layer.gate.d_ptr,
-                self.d_norm,
-                self.d_ffn_out,
-                layer.gate.cols,
-                layer.gate.rows,
-            )?;
-            self.device.launch_gemv_ternary(
-                layer.down.d_ptr,
-                self.d_ffn_out,
-                self.d_out,
-                layer.down.cols,
-                layer.down.rows,
-            )?;
+            // Ternary FFN: no fused SwiGLU kernel, so compute gate and up with
+            // separate GEMVs, apply SwiGLU on the host, then run the down GEMV
+            // on the activated activations.
+            self.launch_matrix(&layer.gate, self.d_norm, self.d_ffn_out)?;
+            self.launch_matrix(&layer.up, self.d_norm, self.d_ffn_up)?;
+
+            let host_gate = unsafe { &mut *self.h_ffn_gate.get() };
+            let host_up = unsafe { &mut *self.h_ffn_up.get() };
+
+            let gate_rows = layer.gate.rows.min(host_gate.len());
+            let bytes_gate = unsafe {
+                std::slice::from_raw_parts_mut(host_gate.as_mut_ptr().cast::<u8>(), gate_rows * 4)
+            };
+            self.device.copy_from_device(bytes_gate, self.d_ffn_out)?;
+
+            let up_rows = layer.up.rows.min(host_up.len());
+            let bytes_up = unsafe {
+                std::slice::from_raw_parts_mut(host_up.as_mut_ptr().cast::<u8>(), up_rows * 4)
+            };
+            self.device.copy_from_device(bytes_up, self.d_ffn_up)?;
+
+            let act_rows = gate_rows.min(up_rows);
+            ops::swiglu(&mut host_gate[..act_rows], &host_up[..act_rows]);
+
+            let bytes_gate = unsafe {
+                std::slice::from_raw_parts(host_gate.as_ptr().cast::<u8>(), gate_rows * 4)
+            };
+            self.device.copy_to_device(self.d_ffn_out, bytes_gate)?;
+            self.launch_matrix(&layer.down, self.d_ffn_out, self.d_out)?;
         } else if layer.gate.is_q4 {
             self.device.launch_fused_ffn_q4(
                 layer.gate.d_ptr,
@@ -313,13 +351,7 @@ impl CudaEngine {
         self.device.copy_to_device(self.d_norm, bytes_norm)?;
 
         if output_weights.is_ternary {
-            self.device.launch_gemv_ternary(
-                output_weights.d_ptr,
-                self.d_norm,
-                self.d_logits,
-                output_weights.cols,
-                output_weights.rows,
-            )?;
+            self.launch_matrix(output_weights, self.d_norm, self.d_logits)?;
         } else if output_weights.is_q4 {
             self.device.launch_gemv_q4(
                 output_weights.d_ptr,
@@ -362,13 +394,7 @@ impl CudaEngine {
         self.device.copy_to_device(self.d_norm, bytes_norm)?;
 
         if output_weights.is_ternary {
-            self.device.launch_gemv_ternary(
-                output_weights.d_ptr,
-                self.d_norm,
-                self.d_logits,
-                output_weights.cols,
-                output_weights.rows,
-            )?;
+            self.launch_matrix(output_weights, self.d_norm, self.d_logits)?;
         } else if output_weights.is_q4 {
             self.device.launch_gemv_q4(
                 output_weights.d_ptr,
@@ -454,6 +480,7 @@ impl Drop for CudaEngine {
         self.device.free(self.d_qkv);
         self.device.free(self.d_context);
         self.device.free(self.d_ffn_out);
+        self.device.free(self.d_ffn_up);
         self.device.free(self.d_out);
         self.device.free(self.d_logits);
         self.device.free(self.d_token_out);

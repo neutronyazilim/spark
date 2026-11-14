@@ -55,7 +55,10 @@ impl<'a> Transformer<'a> {
         let (v, rest) = rest.split_at_mut(kv_dim);
         let (scores, rest) = rest.split_at_mut(self.config.context_len);
         let (context, rest) = rest.split_at_mut(max_ctx);
-        let (gate, logits) = rest.split_at_mut(max_inter);
+        let (gate, rest) = rest.split_at_mut(max_inter);
+        // logits must be exactly the vocabulary length: gemv validation and
+        // CPU-side sampling must not see leftover scratch slack.
+        let logits = &mut rest[..max_vocab];
 
         embedding(&self.weights.token_embedding, token as usize, x)?;
         let offloaded_gpu_layers = self.cuda.as_ref().map_or(0, |c| c.weights.offloaded_layers);
