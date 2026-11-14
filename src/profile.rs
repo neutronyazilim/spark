@@ -14,6 +14,7 @@ pub struct ProfileStats {
     pub pool_overhead: Duration,
     pub sampling: Duration,
     pub detokenize: Duration,
+    pub resident_cuda: Duration,
     pub forward: Duration,
 }
 
@@ -55,6 +56,7 @@ impl ProfileStats {
             + self.pool_overhead
             + self.sampling
             + self.detokenize
+            + self.resident_cuda
     }
 
     pub fn print(&self, tokens: usize) {
@@ -79,6 +81,7 @@ impl ProfileStats {
             ("Thread Barrier / Sync", self.pool_overhead),
             ("Sampling / Argmax", self.sampling),
             ("Detokenize & I/O", self.detokenize),
+            ("Resident CUDA Forward", self.resident_cuda),
         ];
 
         println!();

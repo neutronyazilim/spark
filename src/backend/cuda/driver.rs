@@ -186,6 +186,14 @@ pub struct CudaDevice {
     pub fn_rope_store_f32: usize,
     pub fn_attn_scores_f32: usize,
     pub fn_attn_weighted_f32: usize,
+    pub fn_quantize_q8_0_128: usize,
+    pub fn_qwen35_q_gate_rope: usize,
+    pub fn_qwen35_kv_rope_store: usize,
+    pub fn_qwen35_attention_gate: usize,
+    pub fn_qwen35_conv_silu: usize,
+    pub fn_qwen35_qk_l2_norm: usize,
+    pub fn_qwen35_decay_beta: usize,
+    pub fn_qwen35_gated_rmsnorm: usize,
     pub fn_keepalive: usize,
     keepalive_host: *mut u32,
     keepalive_dev: usize,
@@ -367,6 +375,14 @@ impl CudaDevice {
             let fn_rope_store_f32 = load_fn!("rope_store_f32");
             let fn_attn_scores_f32 = load_fn!("attn_scores_f32");
             let fn_attn_weighted_f32 = load_fn!("attn_weighted_f32");
+            let fn_quantize_q8_0_128 = load_fn!("quantize_q8_0_128");
+            let fn_qwen35_q_gate_rope = load_fn!("qwen35_q_gate_rope");
+            let fn_qwen35_kv_rope_store = load_fn!("qwen35_kv_rope_store");
+            let fn_qwen35_attention_gate = load_fn!("qwen35_attention_gate");
+            let fn_qwen35_conv_silu = load_fn!("qwen35_conv_silu");
+            let fn_qwen35_qk_l2_norm = load_fn!("qwen35_qk_l2_norm");
+            let fn_qwen35_decay_beta = load_fn!("qwen35_decay_beta");
+            let fn_qwen35_gated_rmsnorm = load_fn!("qwen35_gated_rmsnorm");
             let fn_keepalive = load_fn!("keepalive");
             let fn_gemv_q8_v2 = load_fn!("gemv_q8_0_v2");
             let fn_fused_qkv_q8_v2 = load_fn!("gemv_fused_qkv_q8_0_v2");
@@ -443,6 +459,14 @@ impl CudaDevice {
                 fn_rope_store_f32,
                 fn_attn_scores_f32,
                 fn_attn_weighted_f32,
+                fn_quantize_q8_0_128,
+                fn_qwen35_q_gate_rope,
+                fn_qwen35_kv_rope_store,
+                fn_qwen35_attention_gate,
+                fn_qwen35_conv_silu,
+                fn_qwen35_qk_l2_norm,
+                fn_qwen35_decay_beta,
+                fn_qwen35_gated_rmsnorm,
                 fn_keepalive,
                 keepalive_host: keepalive_host as *mut u32,
                 keepalive_dev,
@@ -452,7 +476,10 @@ impl CudaDevice {
                 use_q1_v2: std::env::var_os("SPARK_NO_Q1_V2").is_none(),
                 use_q1_v3: std::env::var_os("SPARK_Q1_V3").is_some(),
                 use_q1_bitplane: std::env::var_os("SPARK_Q1_BITPLANE").is_some(),
-                use_q1_prmt: std::env::var_os("SPARK_Q1_PRMT").is_some(),
+                use_q1_prmt: std::env::var_os("SPARK_Q1_PRMT").is_some()
+                    || (std::env::var_os("SPARK_NO_Q1_PRMT").is_none()
+                        && std::env::var_os("SPARK_Q1_V3").is_none()
+                        && std::env::var_os("SPARK_Q1_BITPLANE").is_none()),
             })
         }
     }
@@ -1698,6 +1725,224 @@ impl CudaDevice {
         ];
         let grid_x = (n_heads as u32).div_ceil(4);
         self.launch_warps(self.fn_attn_weighted_f32, grid_x, 4, &mut args, "attn_weighted_f32")
+    }
+
+    pub fn launch_quantize_q8_0_128(
+        &self,
+        d_input: usize,
+        d_output: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        if !n.is_multiple_of(128) {
+            return Err(format!("resident Q1 activation length {n} is not divisible by 128"));
+        }
+        let n_u32 = n as u32;
+        let mut args: [*mut c_void; 3] = [
+            &d_input as *const usize as *mut c_void,
+            &d_output as *const usize as *mut c_void,
+            &n_u32 as *const u32 as *mut c_void,
+        ];
+        self.launch_warps(
+            self.fn_quantize_q8_0_128,
+            (n / 32) as u32,
+            1,
+            &mut args,
+            "quantize_q8_0_128",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_qwen35_q_gate_rope(
+        &self,
+        d_raw: usize,
+        d_q: usize,
+        d_gate: usize,
+        d_weight: usize,
+        d_cos_sin: usize,
+        heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        let heads_u32 = heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let rope_dim_u32 = rope_dim as u32;
+        let mut args: [*mut c_void; 9] = [
+            &d_raw as *const usize as *mut c_void,
+            &d_q as *const usize as *mut c_void,
+            &d_gate as *const usize as *mut c_void,
+            &d_weight as *const usize as *mut c_void,
+            &d_cos_sin as *const usize as *mut c_void,
+            &heads_u32 as *const u32 as *mut c_void,
+            &head_dim_u32 as *const u32 as *mut c_void,
+            &rope_dim_u32 as *const u32 as *mut c_void,
+            &epsilon as *const f32 as *mut c_void,
+        ];
+        self.launch_warps(
+            self.fn_qwen35_q_gate_rope,
+            heads_u32.div_ceil(4),
+            4,
+            &mut args,
+            "qwen35_q_gate_rope",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_qwen35_kv_rope_store(
+        &self,
+        d_k_src: usize,
+        d_v_src: usize,
+        d_k_cache: usize,
+        d_v_cache: usize,
+        d_weight: usize,
+        d_cos_sin: usize,
+        d_pos: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        rope_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        let kv_heads_u32 = kv_heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let rope_dim_u32 = rope_dim as u32;
+        let mut args: [*mut c_void; 11] = [
+            &d_k_src as *const usize as *mut c_void,
+            &d_v_src as *const usize as *mut c_void,
+            &d_k_cache as *const usize as *mut c_void,
+            &d_v_cache as *const usize as *mut c_void,
+            &d_weight as *const usize as *mut c_void,
+            &d_cos_sin as *const usize as *mut c_void,
+            &d_pos as *const usize as *mut c_void,
+            &kv_heads_u32 as *const u32 as *mut c_void,
+            &head_dim_u32 as *const u32 as *mut c_void,
+            &rope_dim_u32 as *const u32 as *mut c_void,
+            &epsilon as *const f32 as *mut c_void,
+        ];
+        self.launch_warps(
+            self.fn_qwen35_kv_rope_store,
+            kv_heads_u32.div_ceil(4),
+            4,
+            &mut args,
+            "qwen35_kv_rope_store",
+        )
+    }
+
+    pub fn launch_qwen35_attention_gate(
+        &self,
+        d_values: usize,
+        d_gate: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let n_u32 = n as u32;
+        let mut args: [*mut c_void; 3] = [
+            &d_values as *const usize as *mut c_void,
+            &d_gate as *const usize as *mut c_void,
+            &n_u32 as *const u32 as *mut c_void,
+        ];
+        self.launch_simple(
+            self.fn_qwen35_attention_gate,
+            n_u32.div_ceil(256),
+            &mut args,
+            "qwen35_attention_gate",
+        )
+    }
+
+    pub fn launch_qwen35_conv_silu(
+        &self,
+        d_values: usize,
+        d_weights: usize,
+        d_state: usize,
+        channels: usize,
+        kernel: usize,
+    ) -> Result<(), String> {
+        let channels_u32 = channels as u32;
+        let kernel_u32 = kernel as u32;
+        let mut args: [*mut c_void; 5] = [
+            &d_values as *const usize as *mut c_void,
+            &d_weights as *const usize as *mut c_void,
+            &d_state as *const usize as *mut c_void,
+            &channels_u32 as *const u32 as *mut c_void,
+            &kernel_u32 as *const u32 as *mut c_void,
+        ];
+        self.launch_simple(
+            self.fn_qwen35_conv_silu,
+            channels_u32.div_ceil(256),
+            &mut args,
+            "qwen35_conv_silu",
+        )
+    }
+
+    pub fn launch_qwen35_qk_l2_norm(
+        &self,
+        d_q: usize,
+        d_k: usize,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        let heads_u32 = heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let mut args: [*mut c_void; 5] = [
+            &d_q as *const usize as *mut c_void,
+            &d_k as *const usize as *mut c_void,
+            &heads_u32 as *const u32 as *mut c_void,
+            &head_dim_u32 as *const u32 as *mut c_void,
+            &epsilon as *const f32 as *mut c_void,
+        ];
+        self.launch_warps(
+            self.fn_qwen35_qk_l2_norm,
+            heads_u32.div_ceil(4),
+            4,
+            &mut args,
+            "qwen35_qk_l2_norm",
+        )
+    }
+
+    pub fn launch_qwen35_decay_beta(
+        &self,
+        d_alpha: usize,
+        d_beta: usize,
+        d_dt_bias: usize,
+        d_a: usize,
+        n: usize,
+    ) -> Result<(), String> {
+        let n_u32 = n as u32;
+        let mut args: [*mut c_void; 5] = [
+            &d_alpha as *const usize as *mut c_void,
+            &d_beta as *const usize as *mut c_void,
+            &d_dt_bias as *const usize as *mut c_void,
+            &d_a as *const usize as *mut c_void,
+            &n_u32 as *const u32 as *mut c_void,
+        ];
+        self.launch_simple(self.fn_qwen35_decay_beta, 1, &mut args, "qwen35_decay_beta")
+    }
+
+    pub fn launch_qwen35_gated_rmsnorm(
+        &self,
+        d_values: usize,
+        d_gate: usize,
+        d_weight: usize,
+        heads: usize,
+        head_dim: usize,
+        epsilon: f32,
+    ) -> Result<(), String> {
+        let heads_u32 = heads as u32;
+        let head_dim_u32 = head_dim as u32;
+        let mut args: [*mut c_void; 6] = [
+            &d_values as *const usize as *mut c_void,
+            &d_gate as *const usize as *mut c_void,
+            &d_weight as *const usize as *mut c_void,
+            &heads_u32 as *const u32 as *mut c_void,
+            &head_dim_u32 as *const u32 as *mut c_void,
+            &epsilon as *const f32 as *mut c_void,
+        ];
+        self.launch_warps(
+            self.fn_qwen35_gated_rmsnorm,
+            heads_u32.div_ceil(4),
+            4,
+            &mut args,
+            "qwen35_gated_rmsnorm",
+        )
     }
 }
 

@@ -267,7 +267,26 @@ fn cuda_q1_q2_and_ptq1_match_scalar_multiblock_reference() {
         .copy_from_device(bytes_of_f32_mut(&mut q1_actual), d_q1_output)
         .unwrap();
     assert_close(&q1_actual, &q1_expected, "Q1_0");
+
+    // Resident decode quantizes FP32 activations directly on the GPU. Its
+    // compact output must exactly match the CPU packing consumed above.
+    let d_q1_f32 = device.alloc(q1_input.len() * 4).unwrap();
+    let d_q1_compact = device.alloc(compact_input.len()).unwrap();
+    device
+        .copy_to_device(d_q1_f32, bytes_of_f32(&q1_input))
+        .unwrap();
+    device
+        .launch_quantize_q8_0_128(d_q1_f32, d_q1_compact, q1_input.len())
+        .unwrap();
+    let mut gpu_compact = vec![0u8; compact_input.len()];
+    device
+        .copy_from_device(&mut gpu_compact, d_q1_compact)
+        .unwrap();
+    assert_eq!(gpu_compact, compact_input, "resident Q8 activation packing");
+
     device.free(d_q1_weights);
     device.free(d_q1_input);
     device.free(d_q1_output);
+    device.free(d_q1_f32);
+    device.free(d_q1_compact);
 }

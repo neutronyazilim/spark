@@ -80,13 +80,40 @@ CUDA GPU ile (hibrit katman offloading otomatik):
 Qwen3.5 27B Q1_0 örneği:
 
 ```bash
-./target/release/spark run ./Bonsai-27B-Q1_0.gguf \
+./target/release/spark run ~/Downloads/Bonsai-27B-Q1_0.gguf \
   -p "Merhaba" -n 64 --temp 0 --threads 8
 ```
 
-Q1_0 modelde katman bütçesi ve LM head VRAM'e göre otomatik seçilir. Örneğin
-4 GB RTX 3050 üzerinde 59/64 katman ile output projection birlikte GPU'da
-çalışabilir; kalan recurrent/transformer işlemleri CPU thread pool'da devam eder.
+Qwen3.5 Q1_0 modelde katman bütçesi, ölçek biçimi ve LM head VRAM'e göre
+otomatik seçilir. 4 GB GPU'larda 64 katmanın tamamı, LM head, Gated DeltaNet
+durumu ve 1024 token'a kadar attention cache VRAM'de tutulur. Aktivasyon
+quantization, causal convolution, recurrent update, attention, FFN ve sampling
+aynı CUDA stream'i üzerinde çalışır; decode sırasında katman başına CPU/GPU
+kopyası yapılmaz.
+
+Bu depodaki `Bonsai-27B-Q1_0.gguf` ile RTX 3050 Laptop 4 GB üzerinde ölçülen
+örnek sonuç (32 decode token, greedy):
+
+```text
+prefill: 15 tokens, 19.34 tok/s
+decode: 32 tokens, 19.47 tok/s
+```
+
+4 GB kartlarda varsayılan resident mod, Q1 blok ölçeklerini matris başına 10
+bit'e sıkıştırır. Bu, 1024 token GPU cache'in sığmasını sağlar. Yeterli boş VRAM
+yoksa cache boyutu otomatik olarak yarıya indirilir. Daha yüksek hız
+ve orijinal FP16 ölçekleri birebir korumak için daha kısa cache ile:
+
+```bash
+SPARK_Q1_EXACT_SCALES=1 SPARK_QWEN35_GPU_CONTEXT=64 \
+  ./target/release/spark bench ~/Downloads/Bonsai-27B-Q1_0.gguf \
+  -n 32 --temp 0 --threads 8
+```
+
+Bu mod aynı kartta yaklaşık `26.5 tok/s` decode üretir. Kullanılabilir VRAM'e
+göre `SPARK_QWEN35_GPU_CONTEXT` artırılabilir; fazla büyük değer CUDA allocation
+hatasına yol açarsa değeri düşürün. `SPARK_NO_QWEN35_RESIDENT=1` eski hibrit
+yolu, `SPARK_Q1_HYBRID=1` ise konservatif kısmi katman offload'unu zorlar.
 
 Derlenmiş binary ile:
 

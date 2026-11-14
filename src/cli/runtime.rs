@@ -102,7 +102,7 @@ impl<'a> InferenceSession<'a> {
                 let dev_name = device.name.clone();
                 let dev_arc = Arc::new(device);
                 match CudaQwen35Weights::upload(Arc::clone(&dev_arc), &weights, gpu_layers)
-                    .and_then(|cuda_weights| CudaQwen35Engine::new(dev_arc, cuda_weights))
+                    .and_then(|cuda_weights| CudaQwen35Engine::new(dev_arc, cuda_weights, &config))
                 {
                     Ok(engine) => {
                         println!("\x1b[32m[spark] Qwen35 GPU Acceleration Active: {dev_name}\x1b[0m");
@@ -160,7 +160,11 @@ impl<'a> InferenceSession<'a> {
     }
 
     pub fn context_len(&self) -> usize {
-        self.transformer.config.context_len
+        self.transformer
+            .qwen35_cuda
+            .as_ref()
+            .filter(|cuda| cuda.resident)
+            .map_or(self.transformer.config.context_len, |cuda| cuda.context_capacity)
     }
 
     pub fn thread_count(&self) -> usize {
@@ -240,7 +244,13 @@ impl<'a> InferenceSession<'a> {
             self.logits = None; // consumed initial prefill logits
             t
         } else if let Some(prev) = self.last_token {
-            if self.transformer.cuda.as_ref().is_some_and(|c| c.resident) {
+            if self.transformer.cuda.as_ref().is_some_and(|c| c.resident)
+                || self
+                    .transformer
+                    .qwen35_cuda
+                    .as_ref()
+                    .is_some_and(|cuda| cuda.resident)
+            {
                 let profiler = self.profile.as_mut();
                 self.transformer
                     .forward_token_and_sample(

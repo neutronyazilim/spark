@@ -4294,3 +4294,732 @@ $L_reduce_ffn_v3:
     st.global.f32 [%ff3_outaddr], %ff3_fused;
     ret;
 }
+
+// ================= Qwen3.5 fully resident decode helpers =================
+
+// Quantize one FP32 activation vector to the compact Q8 layout consumed by
+// the Q1_0 kernels. One warp handles one 32-value Q8 block; four consecutive
+// blocks form [4 x f16 scale | 128 x i8 values] (136 bytes).
+.visible .entry quantize_q8_0_128(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred %p_q8_zero, %p_q8_lane0;
+    .reg .b16 %q8_half;
+    .reg .b32 %q8_lane, %q8_block, %q8_idx, %q8_n, %q8_group, %q8_sub;
+    .reg .b32 %q8_off32, %q8_quant;
+    .reg .b64 %q8_in, %q8_out, %q8_addr, %q8_base, %q8_off64;
+    .reg .f32 %q8_x, %q8_abs, %q8_max, %q8_tmp, %q8_scale, %q8_inv, %q8_qf;
+
+    mov.u32 %q8_lane, %tid.x;
+    mov.u32 %q8_block, %ctaid.x;
+    mad.lo.u32 %q8_idx, %q8_block, 32, %q8_lane;
+    ld.param.u32 %q8_n, [n];
+    setp.ge.u32 %p_q8_zero, %q8_idx, %q8_n;
+    @%p_q8_zero ret;
+    ld.param.u64 %q8_in, [input_ptr];
+    ld.param.u64 %q8_out, [output_ptr];
+    mul.wide.u32 %q8_off64, %q8_idx, 4;
+    add.u64 %q8_addr, %q8_in, %q8_off64;
+    ld.global.f32 %q8_x, [%q8_addr];
+    abs.f32 %q8_max, %q8_x;
+    shfl.sync.down.b32 %q8_tmp, %q8_max, 16, 0x1f, 0xffffffff;
+    max.f32 %q8_max, %q8_max, %q8_tmp;
+    shfl.sync.down.b32 %q8_tmp, %q8_max, 8, 0x1f, 0xffffffff;
+    max.f32 %q8_max, %q8_max, %q8_tmp;
+    shfl.sync.down.b32 %q8_tmp, %q8_max, 4, 0x1f, 0xffffffff;
+    max.f32 %q8_max, %q8_max, %q8_tmp;
+    shfl.sync.down.b32 %q8_tmp, %q8_max, 2, 0x1f, 0xffffffff;
+    max.f32 %q8_max, %q8_max, %q8_tmp;
+    shfl.sync.down.b32 %q8_tmp, %q8_max, 1, 0x1f, 0xffffffff;
+    max.f32 %q8_max, %q8_max, %q8_tmp;
+    shfl.sync.idx.b32 %q8_max, %q8_max, 0, 0x1f, 0xffffffff;
+
+    div.rn.f32 %q8_scale, %q8_max, 0f42FE0000; // / 127
+    setp.eq.u32 %p_q8_lane0, %q8_lane, 0;
+    shr.u32 %q8_group, %q8_block, 2;
+    and.b32 %q8_sub, %q8_block, 3;
+    mul.wide.u32 %q8_base, %q8_group, 136;
+    add.u64 %q8_base, %q8_out, %q8_base;
+    @%p_q8_lane0 cvt.rn.f16.f32 %q8_half, %q8_scale;
+    @%p_q8_lane0 shl.b32 %q8_off32, %q8_sub, 1;
+    @%p_q8_lane0 cvt.u64.u32 %q8_off64, %q8_off32;
+    @%p_q8_lane0 add.u64 %q8_addr, %q8_base, %q8_off64;
+    @%p_q8_lane0 st.global.u16 [%q8_addr], %q8_half;
+
+    setp.eq.f32 %p_q8_zero, %q8_max, 0f00000000;
+    div.rn.f32 %q8_inv, 0f42FE0000, %q8_max;
+    @%p_q8_zero mov.f32 %q8_inv, 0f00000000;
+    mul.f32 %q8_qf, %q8_x, %q8_inv;
+    cvt.rni.s32.f32 %q8_quant, %q8_qf;
+    max.s32 %q8_quant, %q8_quant, -127;
+    min.s32 %q8_quant, %q8_quant, 127;
+    shl.b32 %q8_off32, %q8_sub, 5;
+    add.u32 %q8_off32, %q8_off32, %q8_lane;
+    add.u32 %q8_off32, %q8_off32, 8;
+    cvt.u64.u32 %q8_off64, %q8_off32;
+    add.u64 %q8_addr, %q8_base, %q8_off64;
+    st.global.u8 [%q8_addr], %q8_quant;
+    ret;
+}
+
+// Split Qwen3.5's per-head [q | gate] projection, apply head-wise Q RMSNorm,
+// and apply partial NeoX RoPE to the first rope_dim values.
+.visible .entry qwen35_q_gate_rope(
+    .param .u64 raw_ptr,
+    .param .u64 q_ptr,
+    .param .u64 gate_ptr,
+    .param .u64 weight_ptr,
+    .param .u64 cos_sin_ptr,
+    .param .u32 heads,
+    .param .u32 head_dim,
+    .param .u32 rope_dim,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p_qg_bad, %p_qg_done;
+    .reg .b32 %qg_lane, %qg_warp, %qg_head, %qg_heads, %qg_hd, %qg_rd;
+    .reg .b32 %qg_i, %qg_half, %qg_src, %qg_dst, %qg_t;
+    .reg .b64 %qg_raw, %qg_q, %qg_gate, %qg_w, %qg_cs, %qg_addr;
+    .reg .f32 %qg_acc, %qg_tmp, %qg_v, %qg_nf, %qg_eps, %qg_inv;
+    .reg .f32 %qg_a, %qg_b, %qg_wa, %qg_wb, %qg_c, %qg_s, %qg_na, %qg_nb;
+
+    mov.u32 %qg_lane, %tid.x;
+    mov.u32 %qg_warp, %tid.y;
+    mov.u32 %qg_t, %ctaid.x;
+    shl.b32 %qg_t, %qg_t, 2;
+    add.u32 %qg_head, %qg_t, %qg_warp;
+    ld.param.u32 %qg_heads, [heads];
+    setp.ge.u32 %p_qg_bad, %qg_head, %qg_heads;
+    @%p_qg_bad ret;
+    ld.param.u32 %qg_hd, [head_dim];
+    ld.param.u32 %qg_rd, [rope_dim];
+    ld.param.u64 %qg_raw, [raw_ptr];
+    ld.param.u64 %qg_q, [q_ptr];
+    ld.param.u64 %qg_gate, [gate_ptr];
+    ld.param.u64 %qg_w, [weight_ptr];
+    ld.param.u64 %qg_cs, [cos_sin_ptr];
+
+    // q source starts at head * (2 * head_dim)
+    shl.b32 %qg_t, %qg_hd, 1;
+    mul.lo.u32 %qg_src, %qg_head, %qg_t;
+    mul.lo.u32 %qg_dst, %qg_head, %qg_hd;
+    mov.f32 %qg_acc, 0f00000000;
+    mov.u32 %qg_i, %qg_lane;
+$L_qg_sum:
+    setp.ge.u32 %p_qg_done, %qg_i, %qg_hd;
+    @%p_qg_done bra $L_qg_reduce;
+    add.u32 %qg_t, %qg_src, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_raw, %qg_addr;
+    ld.global.f32 %qg_v, [%qg_addr];
+    fma.rn.f32 %qg_acc, %qg_v, %qg_v, %qg_acc;
+    add.u32 %qg_i, %qg_i, 32;
+    bra $L_qg_sum;
+$L_qg_reduce:
+    shfl.sync.down.b32 %qg_tmp, %qg_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %qg_acc, %qg_acc, %qg_tmp;
+    shfl.sync.down.b32 %qg_tmp, %qg_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %qg_acc, %qg_acc, %qg_tmp;
+    shfl.sync.down.b32 %qg_tmp, %qg_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %qg_acc, %qg_acc, %qg_tmp;
+    shfl.sync.down.b32 %qg_tmp, %qg_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %qg_acc, %qg_acc, %qg_tmp;
+    shfl.sync.down.b32 %qg_tmp, %qg_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %qg_acc, %qg_acc, %qg_tmp;
+    shfl.sync.idx.b32 %qg_acc, %qg_acc, 0, 0x1f, 0xffffffff;
+    cvt.rn.f32.u32 %qg_nf, %qg_hd;
+    div.rn.f32 %qg_acc, %qg_acc, %qg_nf;
+    ld.param.f32 %qg_eps, [epsilon];
+    add.f32 %qg_acc, %qg_acc, %qg_eps;
+    sqrt.rn.f32 %qg_acc, %qg_acc;
+    rcp.approx.f32 %qg_inv, %qg_acc;
+
+    // Copy the gate and normalize the non-RoPE tail.
+    mov.u32 %qg_i, %qg_lane;
+$L_qg_copy:
+    setp.ge.u32 %p_qg_done, %qg_i, %qg_hd;
+    @%p_qg_done bra $L_qg_pairs;
+    add.u32 %qg_t, %qg_src, %qg_hd;
+    add.u32 %qg_t, %qg_t, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_raw, %qg_addr;
+    ld.global.f32 %qg_v, [%qg_addr];
+    add.u32 %qg_t, %qg_dst, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_gate, %qg_addr;
+    st.global.f32 [%qg_addr], %qg_v;
+    setp.lt.u32 %p_qg_bad, %qg_i, %qg_rd;
+    @%p_qg_bad bra $L_qg_copy_next;
+    add.u32 %qg_t, %qg_src, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_raw, %qg_addr;
+    ld.global.f32 %qg_v, [%qg_addr];
+    mul.wide.u32 %qg_addr, %qg_i, 4;
+    add.u64 %qg_addr, %qg_w, %qg_addr;
+    ld.global.f32 %qg_wa, [%qg_addr];
+    mul.f32 %qg_v, %qg_v, %qg_inv;
+    mul.f32 %qg_v, %qg_v, %qg_wa;
+    add.u32 %qg_t, %qg_dst, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_q, %qg_addr;
+    st.global.f32 [%qg_addr], %qg_v;
+$L_qg_copy_next:
+    add.u32 %qg_i, %qg_i, 32;
+    bra $L_qg_copy;
+
+$L_qg_pairs:
+    shr.u32 %qg_half, %qg_rd, 1;
+    mov.u32 %qg_i, %qg_lane;
+$L_qg_pair_loop:
+    setp.ge.u32 %p_qg_done, %qg_i, %qg_half;
+    @%p_qg_done ret;
+    add.u32 %qg_t, %qg_src, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_raw, %qg_addr;
+    ld.global.f32 %qg_a, [%qg_addr];
+    add.u32 %qg_t, %qg_i, %qg_half;
+    add.u32 %qg_t, %qg_src, %qg_t;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_raw, %qg_addr;
+    ld.global.f32 %qg_b, [%qg_addr];
+    mul.wide.u32 %qg_addr, %qg_i, 4;
+    add.u64 %qg_addr, %qg_w, %qg_addr;
+    ld.global.f32 %qg_wa, [%qg_addr];
+    add.u32 %qg_t, %qg_i, %qg_half;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_w, %qg_addr;
+    ld.global.f32 %qg_wb, [%qg_addr];
+    mul.f32 %qg_a, %qg_a, %qg_inv;
+    mul.f32 %qg_a, %qg_a, %qg_wa;
+    mul.f32 %qg_b, %qg_b, %qg_inv;
+    mul.f32 %qg_b, %qg_b, %qg_wb;
+    mul.wide.u32 %qg_addr, %qg_i, 4;
+    add.u64 %qg_addr, %qg_cs, %qg_addr;
+    ld.global.f32 %qg_c, [%qg_addr];
+    add.u32 %qg_t, %qg_i, %qg_half;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_cs, %qg_addr;
+    ld.global.f32 %qg_s, [%qg_addr];
+    mul.f32 %qg_na, %qg_a, %qg_c;
+    mul.f32 %qg_tmp, %qg_b, %qg_s;
+    sub.f32 %qg_na, %qg_na, %qg_tmp;
+    mul.f32 %qg_nb, %qg_b, %qg_c;
+    fma.rn.f32 %qg_nb, %qg_a, %qg_s, %qg_nb;
+    add.u32 %qg_t, %qg_dst, %qg_i;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_q, %qg_addr;
+    st.global.f32 [%qg_addr], %qg_na;
+    add.u32 %qg_t, %qg_i, %qg_half;
+    add.u32 %qg_t, %qg_dst, %qg_t;
+    mul.wide.u32 %qg_addr, %qg_t, 4;
+    add.u64 %qg_addr, %qg_q, %qg_addr;
+    st.global.f32 [%qg_addr], %qg_nb;
+    add.u32 %qg_i, %qg_i, 32;
+    bra $L_qg_pair_loop;
+}
+
+// Head-wise K RMSNorm + partial RoPE + K/V cache store.
+.visible .entry qwen35_kv_rope_store(
+    .param .u64 k_src_ptr,
+    .param .u64 v_src_ptr,
+    .param .u64 k_cache_ptr,
+    .param .u64 v_cache_ptr,
+    .param .u64 weight_ptr,
+    .param .u64 cos_sin_ptr,
+    .param .u64 pos_ptr,
+    .param .u32 kv_heads,
+    .param .u32 head_dim,
+    .param .u32 rope_dim,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p_kv_bad, %p_kv_done;
+    .reg .b32 %kv_lane, %kv_warp, %kv_head, %kv_heads_n, %kv_hd, %kv_rd, %kv_pos;
+    .reg .b32 %kv_i, %kv_half, %kv_src, %kv_dst, %kv_t, %kv_stride;
+    .reg .b64 %kv_ks, %kv_vs, %kv_kc, %kv_vc, %kv_w, %kv_cs, %kv_pp, %kv_addr;
+    .reg .f32 %kv_acc, %kv_tmp, %kv_v, %kv_nf, %kv_eps, %kv_inv;
+    .reg .f32 %kv_a, %kv_b, %kv_wa, %kv_wb, %kv_c, %kv_s, %kv_na, %kv_nb;
+    mov.u32 %kv_lane, %tid.x;
+    mov.u32 %kv_warp, %tid.y;
+    mov.u32 %kv_t, %ctaid.x;
+    shl.b32 %kv_t, %kv_t, 2;
+    add.u32 %kv_head, %kv_t, %kv_warp;
+    ld.param.u32 %kv_heads_n, [kv_heads];
+    setp.ge.u32 %p_kv_bad, %kv_head, %kv_heads_n;
+    @%p_kv_bad ret;
+    ld.param.u32 %kv_hd, [head_dim];
+    ld.param.u32 %kv_rd, [rope_dim];
+    ld.param.u64 %kv_ks, [k_src_ptr];
+    ld.param.u64 %kv_vs, [v_src_ptr];
+    ld.param.u64 %kv_kc, [k_cache_ptr];
+    ld.param.u64 %kv_vc, [v_cache_ptr];
+    ld.param.u64 %kv_w, [weight_ptr];
+    ld.param.u64 %kv_cs, [cos_sin_ptr];
+    ld.param.u64 %kv_pp, [pos_ptr];
+    ld.global.u32 %kv_pos, [%kv_pp];
+    mul.lo.u32 %kv_stride, %kv_heads_n, %kv_hd;
+    mul.lo.u32 %kv_src, %kv_head, %kv_hd;
+    mad.lo.u32 %kv_dst, %kv_pos, %kv_stride, %kv_src;
+    mov.f32 %kv_acc, 0f00000000;
+    mov.u32 %kv_i, %kv_lane;
+$L_kv_sum:
+    setp.ge.u32 %p_kv_done, %kv_i, %kv_hd;
+    @%p_kv_done bra $L_kv_reduce;
+    add.u32 %kv_t, %kv_src, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_ks, %kv_addr;
+    ld.global.f32 %kv_v, [%kv_addr];
+    fma.rn.f32 %kv_acc, %kv_v, %kv_v, %kv_acc;
+    add.u32 %kv_i, %kv_i, 32;
+    bra $L_kv_sum;
+$L_kv_reduce:
+    shfl.sync.down.b32 %kv_tmp, %kv_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %kv_acc, %kv_acc, %kv_tmp;
+    shfl.sync.down.b32 %kv_tmp, %kv_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %kv_acc, %kv_acc, %kv_tmp;
+    shfl.sync.down.b32 %kv_tmp, %kv_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %kv_acc, %kv_acc, %kv_tmp;
+    shfl.sync.down.b32 %kv_tmp, %kv_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %kv_acc, %kv_acc, %kv_tmp;
+    shfl.sync.down.b32 %kv_tmp, %kv_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %kv_acc, %kv_acc, %kv_tmp;
+    shfl.sync.idx.b32 %kv_acc, %kv_acc, 0, 0x1f, 0xffffffff;
+    cvt.rn.f32.u32 %kv_nf, %kv_hd;
+    div.rn.f32 %kv_acc, %kv_acc, %kv_nf;
+    ld.param.f32 %kv_eps, [epsilon];
+    add.f32 %kv_acc, %kv_acc, %kv_eps;
+    sqrt.rn.f32 %kv_acc, %kv_acc;
+    rcp.approx.f32 %kv_inv, %kv_acc;
+    mov.u32 %kv_i, %kv_lane;
+$L_kv_copy:
+    setp.ge.u32 %p_kv_done, %kv_i, %kv_hd;
+    @%p_kv_done bra $L_kv_pairs;
+    add.u32 %kv_t, %kv_src, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_vs, %kv_addr;
+    ld.global.f32 %kv_v, [%kv_addr];
+    add.u32 %kv_t, %kv_dst, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_vc, %kv_addr;
+    st.global.f32 [%kv_addr], %kv_v;
+    setp.lt.u32 %p_kv_bad, %kv_i, %kv_rd;
+    @%p_kv_bad bra $L_kv_copy_next;
+    add.u32 %kv_t, %kv_src, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_ks, %kv_addr;
+    ld.global.f32 %kv_v, [%kv_addr];
+    mul.wide.u32 %kv_addr, %kv_i, 4;
+    add.u64 %kv_addr, %kv_w, %kv_addr;
+    ld.global.f32 %kv_wa, [%kv_addr];
+    mul.f32 %kv_v, %kv_v, %kv_inv;
+    mul.f32 %kv_v, %kv_v, %kv_wa;
+    add.u32 %kv_t, %kv_dst, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_kc, %kv_addr;
+    st.global.f32 [%kv_addr], %kv_v;
+$L_kv_copy_next:
+    add.u32 %kv_i, %kv_i, 32;
+    bra $L_kv_copy;
+$L_kv_pairs:
+    shr.u32 %kv_half, %kv_rd, 1;
+    mov.u32 %kv_i, %kv_lane;
+$L_kv_pair_loop:
+    setp.ge.u32 %p_kv_done, %kv_i, %kv_half;
+    @%p_kv_done ret;
+    add.u32 %kv_t, %kv_src, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_ks, %kv_addr;
+    ld.global.f32 %kv_a, [%kv_addr];
+    add.u32 %kv_t, %kv_i, %kv_half;
+    add.u32 %kv_t, %kv_src, %kv_t;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_ks, %kv_addr;
+    ld.global.f32 %kv_b, [%kv_addr];
+    mul.wide.u32 %kv_addr, %kv_i, 4;
+    add.u64 %kv_addr, %kv_w, %kv_addr;
+    ld.global.f32 %kv_wa, [%kv_addr];
+    add.u32 %kv_t, %kv_i, %kv_half;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_w, %kv_addr;
+    ld.global.f32 %kv_wb, [%kv_addr];
+    mul.f32 %kv_a, %kv_a, %kv_inv;
+    mul.f32 %kv_a, %kv_a, %kv_wa;
+    mul.f32 %kv_b, %kv_b, %kv_inv;
+    mul.f32 %kv_b, %kv_b, %kv_wb;
+    mul.wide.u32 %kv_addr, %kv_i, 4;
+    add.u64 %kv_addr, %kv_cs, %kv_addr;
+    ld.global.f32 %kv_c, [%kv_addr];
+    add.u32 %kv_t, %kv_i, %kv_half;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_cs, %kv_addr;
+    ld.global.f32 %kv_s, [%kv_addr];
+    mul.f32 %kv_na, %kv_a, %kv_c;
+    mul.f32 %kv_tmp, %kv_b, %kv_s;
+    sub.f32 %kv_na, %kv_na, %kv_tmp;
+    mul.f32 %kv_nb, %kv_b, %kv_c;
+    fma.rn.f32 %kv_nb, %kv_a, %kv_s, %kv_nb;
+    add.u32 %kv_t, %kv_dst, %kv_i;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_kc, %kv_addr;
+    st.global.f32 [%kv_addr], %kv_na;
+    add.u32 %kv_t, %kv_i, %kv_half;
+    add.u32 %kv_t, %kv_dst, %kv_t;
+    mul.wide.u32 %kv_addr, %kv_t, 4;
+    add.u64 %kv_addr, %kv_kc, %kv_addr;
+    st.global.f32 [%kv_addr], %kv_nb;
+    add.u32 %kv_i, %kv_i, 32;
+    bra $L_kv_pair_loop;
+}
+
+.visible .entry qwen35_attention_gate(
+    .param .u64 values_ptr,
+    .param .u64 gate_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred %p_ag_done;
+    .reg .b32 %ag_i, %ag_n, %ag_t;
+    .reg .b64 %ag_values, %ag_gate, %ag_addr;
+    .reg .f32 %ag_v, %ag_g, %ag_e, %ag_sig;
+    mov.u32 %ag_t, %ctaid.x;
+    shl.b32 %ag_t, %ag_t, 8;
+    mov.u32 %ag_i, %tid.x;
+    add.u32 %ag_i, %ag_t, %ag_i;
+    ld.param.u32 %ag_n, [n];
+    setp.ge.u32 %p_ag_done, %ag_i, %ag_n;
+    @%p_ag_done ret;
+    ld.param.u64 %ag_values, [values_ptr];
+    ld.param.u64 %ag_gate, [gate_ptr];
+    mul.wide.u32 %ag_addr, %ag_i, 4;
+    add.u64 %ag_gate, %ag_gate, %ag_addr;
+    ld.global.f32 %ag_g, [%ag_gate];
+    neg.f32 %ag_e, %ag_g;
+    mul.f32 %ag_e, %ag_e, 0f3FB8AA3B;
+    ex2.approx.f32 %ag_e, %ag_e;
+    add.f32 %ag_e, %ag_e, 0f3F800000;
+    rcp.approx.f32 %ag_sig, %ag_e;
+    add.u64 %ag_values, %ag_values, %ag_addr;
+    ld.global.f32 %ag_v, [%ag_values];
+    mul.f32 %ag_v, %ag_v, %ag_sig;
+    st.global.f32 [%ag_values], %ag_v;
+    ret;
+}
+
+// Depth-wise causal convolution with a per-layer [channel][kernel-1] state.
+.visible .entry qwen35_conv_silu(
+    .param .u64 values_ptr,
+    .param .u64 weights_ptr,
+    .param .u64 state_ptr,
+    .param .u32 channels,
+    .param .u32 kernel
+)
+{
+    .reg .pred %p_cv_done, %p_cv_loop;
+    .reg .b32 %cv_i, %cv_n, %cv_k, %cv_hist, %cv_j, %cv_t, %cv_idx;
+    .reg .b64 %cv_values, %cv_weights, %cv_state, %cv_addr;
+    .reg .f32 %cv_x, %cv_w, %cv_s, %cv_acc, %cv_e, %cv_sig;
+    mov.u32 %cv_t, %ctaid.x;
+    shl.b32 %cv_t, %cv_t, 8;
+    mov.u32 %cv_i, %tid.x;
+    add.u32 %cv_i, %cv_t, %cv_i;
+    ld.param.u32 %cv_n, [channels];
+    setp.ge.u32 %p_cv_done, %cv_i, %cv_n;
+    @%p_cv_done ret;
+    ld.param.u32 %cv_k, [kernel];
+    sub.u32 %cv_hist, %cv_k, 1;
+    ld.param.u64 %cv_values, [values_ptr];
+    ld.param.u64 %cv_weights, [weights_ptr];
+    ld.param.u64 %cv_state, [state_ptr];
+    mul.wide.u32 %cv_addr, %cv_i, 4;
+    add.u64 %cv_addr, %cv_values, %cv_addr;
+    ld.global.f32 %cv_x, [%cv_addr];
+    mad.lo.u32 %cv_idx, %cv_i, %cv_k, %cv_hist;
+    mul.wide.u32 %cv_addr, %cv_idx, 4;
+    add.u64 %cv_addr, %cv_weights, %cv_addr;
+    ld.global.f32 %cv_w, [%cv_addr];
+    mul.f32 %cv_acc, %cv_x, %cv_w;
+    mov.u32 %cv_j, 0;
+$L_cv_acc:
+    setp.ge.u32 %p_cv_loop, %cv_j, %cv_hist;
+    @%p_cv_loop bra $L_cv_shift;
+    mad.lo.u32 %cv_idx, %cv_i, %cv_hist, %cv_j;
+    mul.wide.u32 %cv_addr, %cv_idx, 4;
+    add.u64 %cv_addr, %cv_state, %cv_addr;
+    ld.global.f32 %cv_s, [%cv_addr];
+    mad.lo.u32 %cv_idx, %cv_i, %cv_k, %cv_j;
+    mul.wide.u32 %cv_addr, %cv_idx, 4;
+    add.u64 %cv_addr, %cv_weights, %cv_addr;
+    ld.global.f32 %cv_w, [%cv_addr];
+    fma.rn.f32 %cv_acc, %cv_s, %cv_w, %cv_acc;
+    add.u32 %cv_j, %cv_j, 1;
+    bra $L_cv_acc;
+$L_cv_shift:
+    mov.u32 %cv_j, 0;
+$L_cv_shift_loop:
+    add.u32 %cv_t, %cv_j, 1;
+    setp.ge.u32 %p_cv_loop, %cv_t, %cv_hist;
+    @%p_cv_loop bra $L_cv_append;
+    mad.lo.u32 %cv_idx, %cv_i, %cv_hist, %cv_t;
+    mul.wide.u32 %cv_addr, %cv_idx, 4;
+    add.u64 %cv_addr, %cv_state, %cv_addr;
+    ld.global.f32 %cv_s, [%cv_addr];
+    mad.lo.u32 %cv_idx, %cv_i, %cv_hist, %cv_j;
+    mul.wide.u32 %cv_addr, %cv_idx, 4;
+    add.u64 %cv_addr, %cv_state, %cv_addr;
+    st.global.f32 [%cv_addr], %cv_s;
+    add.u32 %cv_j, %cv_j, 1;
+    bra $L_cv_shift_loop;
+$L_cv_append:
+    sub.u32 %cv_j, %cv_hist, 1;
+    mad.lo.u32 %cv_idx, %cv_i, %cv_hist, %cv_j;
+    mul.wide.u32 %cv_addr, %cv_idx, 4;
+    add.u64 %cv_addr, %cv_state, %cv_addr;
+    st.global.f32 [%cv_addr], %cv_x;
+    neg.f32 %cv_e, %cv_acc;
+    mul.f32 %cv_e, %cv_e, 0f3FB8AA3B;
+    ex2.approx.f32 %cv_e, %cv_e;
+    add.f32 %cv_e, %cv_e, 0f3F800000;
+    rcp.approx.f32 %cv_sig, %cv_e;
+    mul.f32 %cv_acc, %cv_acc, %cv_sig;
+    mul.wide.u32 %cv_addr, %cv_i, 4;
+    add.u64 %cv_addr, %cv_values, %cv_addr;
+    st.global.f32 [%cv_addr], %cv_acc;
+    ret;
+}
+
+// L2-normalize recurrent Q and K, one warp per key head.
+.visible .entry qwen35_qk_l2_norm(
+    .param .u64 q_ptr,
+    .param .u64 k_ptr,
+    .param .u32 heads,
+    .param .u32 head_dim,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p_l2_bad, %p_l2_done;
+    .reg .b32 %l2_lane, %l2_warp, %l2_head, %l2_heads, %l2_hd, %l2_i, %l2_t;
+    .reg .b64 %l2_q, %l2_k, %l2_addr;
+    .reg .f32 %l2_qs, %l2_ks, %l2_qv, %l2_kv, %l2_tmp, %l2_eps, %l2_qinv, %l2_kinv;
+    mov.u32 %l2_lane, %tid.x;
+    mov.u32 %l2_warp, %tid.y;
+    mov.u32 %l2_t, %ctaid.x;
+    shl.b32 %l2_t, %l2_t, 2;
+    add.u32 %l2_head, %l2_t, %l2_warp;
+    ld.param.u32 %l2_heads, [heads];
+    setp.ge.u32 %p_l2_bad, %l2_head, %l2_heads;
+    @%p_l2_bad ret;
+    ld.param.u32 %l2_hd, [head_dim];
+    ld.param.u64 %l2_q, [q_ptr];
+    ld.param.u64 %l2_k, [k_ptr];
+    mad.lo.u32 %l2_i, %l2_head, %l2_hd, %l2_lane;
+    mov.f32 %l2_qs, 0f00000000;
+    mov.f32 %l2_ks, 0f00000000;
+$L_l2_sum:
+    add.u32 %l2_t, %l2_head, 1;
+    mul.lo.u32 %l2_t, %l2_t, %l2_hd;
+    setp.ge.u32 %p_l2_done, %l2_i, %l2_t;
+    @%p_l2_done bra $L_l2_reduce;
+    mul.wide.u32 %l2_addr, %l2_i, 4;
+    add.u64 %l2_addr, %l2_q, %l2_addr;
+    ld.global.f32 %l2_qv, [%l2_addr];
+    mul.wide.u32 %l2_addr, %l2_i, 4;
+    add.u64 %l2_addr, %l2_k, %l2_addr;
+    ld.global.f32 %l2_kv, [%l2_addr];
+    fma.rn.f32 %l2_qs, %l2_qv, %l2_qv, %l2_qs;
+    fma.rn.f32 %l2_ks, %l2_kv, %l2_kv, %l2_ks;
+    add.u32 %l2_i, %l2_i, 32;
+    bra $L_l2_sum;
+$L_l2_reduce:
+    shfl.sync.down.b32 %l2_tmp, %l2_qs, 16, 0x1f, 0xffffffff;
+    add.f32 %l2_qs, %l2_qs, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_ks, 16, 0x1f, 0xffffffff;
+    add.f32 %l2_ks, %l2_ks, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_qs, 8, 0x1f, 0xffffffff;
+    add.f32 %l2_qs, %l2_qs, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_ks, 8, 0x1f, 0xffffffff;
+    add.f32 %l2_ks, %l2_ks, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_qs, 4, 0x1f, 0xffffffff;
+    add.f32 %l2_qs, %l2_qs, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_ks, 4, 0x1f, 0xffffffff;
+    add.f32 %l2_ks, %l2_ks, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_qs, 2, 0x1f, 0xffffffff;
+    add.f32 %l2_qs, %l2_qs, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_ks, 2, 0x1f, 0xffffffff;
+    add.f32 %l2_ks, %l2_ks, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_qs, 1, 0x1f, 0xffffffff;
+    add.f32 %l2_qs, %l2_qs, %l2_tmp;
+    shfl.sync.down.b32 %l2_tmp, %l2_ks, 1, 0x1f, 0xffffffff;
+    add.f32 %l2_ks, %l2_ks, %l2_tmp;
+    shfl.sync.idx.b32 %l2_qs, %l2_qs, 0, 0x1f, 0xffffffff;
+    shfl.sync.idx.b32 %l2_ks, %l2_ks, 0, 0x1f, 0xffffffff;
+    ld.param.f32 %l2_eps, [epsilon];
+    add.f32 %l2_qs, %l2_qs, %l2_eps;
+    add.f32 %l2_ks, %l2_ks, %l2_eps;
+    sqrt.rn.f32 %l2_qs, %l2_qs;
+    sqrt.rn.f32 %l2_ks, %l2_ks;
+    rcp.approx.f32 %l2_qinv, %l2_qs;
+    rcp.approx.f32 %l2_kinv, %l2_ks;
+    mad.lo.u32 %l2_i, %l2_head, %l2_hd, %l2_lane;
+$L_l2_store:
+    mul.lo.u32 %l2_t, %l2_head, %l2_hd;
+    add.u32 %l2_t, %l2_t, %l2_hd;
+    setp.ge.u32 %p_l2_done, %l2_i, %l2_t;
+    @%p_l2_done ret;
+    mul.wide.u32 %l2_addr, %l2_i, 4;
+    add.u64 %l2_addr, %l2_q, %l2_addr;
+    ld.global.f32 %l2_qv, [%l2_addr];
+    mul.f32 %l2_qv, %l2_qv, %l2_qinv;
+    st.global.f32 [%l2_addr], %l2_qv;
+    mul.wide.u32 %l2_addr, %l2_i, 4;
+    add.u64 %l2_addr, %l2_k, %l2_addr;
+    ld.global.f32 %l2_kv, [%l2_addr];
+    mul.f32 %l2_kv, %l2_kv, %l2_kinv;
+    st.global.f32 [%l2_addr], %l2_kv;
+    add.u32 %l2_i, %l2_i, 32;
+    bra $L_l2_store;
+}
+
+// Convert raw alpha/beta projections to multiplicative decay and sigmoid beta.
+.visible .entry qwen35_decay_beta(
+    .param .u64 alpha_ptr,
+    .param .u64 beta_ptr,
+    .param .u64 dt_bias_ptr,
+    .param .u64 a_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred %p_db_done, %p_db_hi, %p_db_lo;
+    .reg .b32 %db_i, %db_n;
+    .reg .b64 %db_alpha, %db_beta, %db_dt, %db_a, %db_addr;
+    .reg .f32 %db_x, %db_b, %db_av, %db_e, %db_sp, %db_decay, %db_sig, %db_clamp;
+    mov.u32 %db_i, %tid.x;
+    ld.param.u32 %db_n, [n];
+    setp.ge.u32 %p_db_done, %db_i, %db_n;
+    @%p_db_done ret;
+    ld.param.u64 %db_alpha, [alpha_ptr];
+    ld.param.u64 %db_beta, [beta_ptr];
+    ld.param.u64 %db_dt, [dt_bias_ptr];
+    ld.param.u64 %db_a, [a_ptr];
+    mul.wide.u32 %db_addr, %db_i, 4;
+    add.u64 %db_alpha, %db_alpha, %db_addr;
+    add.u64 %db_beta, %db_beta, %db_addr;
+    add.u64 %db_dt, %db_dt, %db_addr;
+    add.u64 %db_a, %db_a, %db_addr;
+    ld.global.f32 %db_x, [%db_alpha];
+    ld.global.f32 %db_b, [%db_dt];
+    add.f32 %db_x, %db_x, %db_b;
+    max.f32 %db_clamp, %db_x, 0fC1A00000;
+    min.f32 %db_clamp, %db_clamp, 0f41A00000;
+    mul.f32 %db_e, %db_clamp, 0f3FB8AA3B;
+    ex2.approx.f32 %db_e, %db_e;
+    add.f32 %db_sp, %db_e, 0f3F800000;
+    lg2.approx.f32 %db_sp, %db_sp;
+    mul.f32 %db_sp, %db_sp, 0f3F317218;
+    setp.gt.f32 %p_db_hi, %db_x, 0f41A00000;
+    @%p_db_hi mov.f32 %db_sp, %db_x;
+    ld.global.f32 %db_av, [%db_a];
+    mul.f32 %db_decay, %db_sp, %db_av;
+    mul.f32 %db_decay, %db_decay, 0f3FB8AA3B;
+    ex2.approx.f32 %db_decay, %db_decay;
+    st.global.f32 [%db_alpha], %db_decay;
+    ld.global.f32 %db_b, [%db_beta];
+    neg.f32 %db_e, %db_b;
+    mul.f32 %db_e, %db_e, 0f3FB8AA3B;
+    ex2.approx.f32 %db_e, %db_e;
+    add.f32 %db_e, %db_e, 0f3F800000;
+    rcp.approx.f32 %db_sig, %db_e;
+    st.global.f32 [%db_beta], %db_sig;
+    ret;
+}
+
+// Per-value-head RMSNorm followed by the Qwen3.5 SiLU(z) gate.
+.visible .entry qwen35_gated_rmsnorm(
+    .param .u64 values_ptr,
+    .param .u64 gate_ptr,
+    .param .u64 weight_ptr,
+    .param .u32 heads,
+    .param .u32 head_dim,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p_gr_bad, %p_gr_done;
+    .reg .b32 %gr_lane, %gr_warp, %gr_head, %gr_heads, %gr_hd, %gr_i, %gr_t;
+    .reg .b64 %gr_values, %gr_gate, %gr_weight, %gr_addr;
+    .reg .f32 %gr_acc, %gr_tmp, %gr_v, %gr_g, %gr_w, %gr_eps, %gr_inv, %gr_e, %gr_sig;
+    mov.u32 %gr_lane, %tid.x;
+    mov.u32 %gr_warp, %tid.y;
+    mov.u32 %gr_t, %ctaid.x;
+    shl.b32 %gr_t, %gr_t, 2;
+    add.u32 %gr_head, %gr_t, %gr_warp;
+    ld.param.u32 %gr_heads, [heads];
+    setp.ge.u32 %p_gr_bad, %gr_head, %gr_heads;
+    @%p_gr_bad ret;
+    ld.param.u32 %gr_hd, [head_dim];
+    ld.param.u64 %gr_values, [values_ptr];
+    ld.param.u64 %gr_gate, [gate_ptr];
+    ld.param.u64 %gr_weight, [weight_ptr];
+    mad.lo.u32 %gr_i, %gr_head, %gr_hd, %gr_lane;
+    mov.f32 %gr_acc, 0f00000000;
+$L_gr_sum:
+    mul.lo.u32 %gr_t, %gr_head, %gr_hd;
+    add.u32 %gr_t, %gr_t, %gr_hd;
+    setp.ge.u32 %p_gr_done, %gr_i, %gr_t;
+    @%p_gr_done bra $L_gr_reduce;
+    mul.wide.u32 %gr_addr, %gr_i, 4;
+    add.u64 %gr_addr, %gr_values, %gr_addr;
+    ld.global.f32 %gr_v, [%gr_addr];
+    fma.rn.f32 %gr_acc, %gr_v, %gr_v, %gr_acc;
+    add.u32 %gr_i, %gr_i, 32;
+    bra $L_gr_sum;
+$L_gr_reduce:
+    shfl.sync.down.b32 %gr_tmp, %gr_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %gr_acc, %gr_acc, %gr_tmp;
+    shfl.sync.down.b32 %gr_tmp, %gr_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %gr_acc, %gr_acc, %gr_tmp;
+    shfl.sync.down.b32 %gr_tmp, %gr_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %gr_acc, %gr_acc, %gr_tmp;
+    shfl.sync.down.b32 %gr_tmp, %gr_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %gr_acc, %gr_acc, %gr_tmp;
+    shfl.sync.down.b32 %gr_tmp, %gr_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %gr_acc, %gr_acc, %gr_tmp;
+    shfl.sync.idx.b32 %gr_acc, %gr_acc, 0, 0x1f, 0xffffffff;
+    cvt.rn.f32.u32 %gr_tmp, %gr_hd;
+    div.rn.f32 %gr_acc, %gr_acc, %gr_tmp;
+    ld.param.f32 %gr_eps, [epsilon];
+    add.f32 %gr_acc, %gr_acc, %gr_eps;
+    sqrt.rn.f32 %gr_acc, %gr_acc;
+    rcp.approx.f32 %gr_inv, %gr_acc;
+    mad.lo.u32 %gr_i, %gr_head, %gr_hd, %gr_lane;
+$L_gr_store:
+    mul.lo.u32 %gr_t, %gr_head, %gr_hd;
+    add.u32 %gr_t, %gr_t, %gr_hd;
+    setp.ge.u32 %p_gr_done, %gr_i, %gr_t;
+    @%p_gr_done ret;
+    mul.wide.u32 %gr_addr, %gr_i, 4;
+    add.u64 %gr_addr, %gr_values, %gr_addr;
+    ld.global.f32 %gr_v, [%gr_addr];
+    mul.wide.u32 %gr_addr, %gr_i, 4;
+    add.u64 %gr_addr, %gr_gate, %gr_addr;
+    ld.global.f32 %gr_g, [%gr_addr];
+    rem.u32 %gr_t, %gr_i, %gr_hd;
+    mul.wide.u32 %gr_addr, %gr_t, 4;
+    add.u64 %gr_addr, %gr_weight, %gr_addr;
+    ld.global.f32 %gr_w, [%gr_addr];
+    neg.f32 %gr_e, %gr_g;
+    mul.f32 %gr_e, %gr_e, 0f3FB8AA3B;
+    ex2.approx.f32 %gr_e, %gr_e;
+    add.f32 %gr_e, %gr_e, 0f3F800000;
+    rcp.approx.f32 %gr_sig, %gr_e;
+    mul.f32 %gr_g, %gr_g, %gr_sig;
+    mul.f32 %gr_v, %gr_v, %gr_inv;
+    mul.f32 %gr_v, %gr_v, %gr_w;
+    mul.f32 %gr_v, %gr_v, %gr_g;
+    mul.wide.u32 %gr_addr, %gr_i, 4;
+    add.u64 %gr_addr, %gr_values, %gr_addr;
+    st.global.f32 [%gr_addr], %gr_v;
+    add.u32 %gr_i, %gr_i, 32;
+    bra $L_gr_store;
+}

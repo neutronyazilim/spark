@@ -32,6 +32,24 @@ impl<'a> Transformer<'a> {
         }
 
         if self.config.is_qwen35 {
+            if let Some(cuda) = self.qwen35_cuda.as_ref().filter(|cuda| cuda.resident) {
+                let hidden = self.config.hidden_dim;
+                let max_vocab = self.weights.output.rows().max(self.config.vocab_size);
+                arena.reset();
+                let scratch = arena
+                    .alloc_slice::<f32>(hidden + max_vocab)
+                    .ok_or_else(|| "scratch arena is too small".to_string())?;
+                let (x, rest) = scratch.split_at_mut(hidden);
+                let logits = &mut rest[..max_vocab];
+                embedding(&self.weights.token_embedding, token as usize, x)?;
+                cuda.resident_forward_logits(x, pos, logits)?;
+                record(
+                    &mut profiler,
+                    |profile| &mut profile.resident_cuda,
+                    forward_started,
+                );
+                return Ok(logits);
+            }
             return self.forward_token_qwen35(
                 token,
                 pos,
@@ -348,7 +366,7 @@ impl<'a> Transformer<'a> {
                 } => {
                     let started = profiler.as_ref().and_then(|p| p.start());
                     let gpu = match cuda_layer.map(|layer| &layer.attention) {
-                        Some(CudaQwen35Attention::Full { q, k, v, output }) => {
+                        Some(CudaQwen35Attention::Full { q, k, v, output, .. }) => {
                             (Some(q), Some(k), Some(v), Some(output))
                         }
                         _ => (None, None, None, None),
@@ -448,7 +466,7 @@ impl<'a> Transformer<'a> {
                 } => {
                     let started = profiler.as_ref().and_then(|p| p.start());
                     let gpu = match cuda_layer.map(|layer| &layer.attention) {
-                        Some(CudaQwen35Attention::Recurrent { qkv, z, alpha, beta, output }) => {
+                        Some(CudaQwen35Attention::Recurrent { qkv, z, alpha, beta, output, .. }) => {
                             (Some(qkv), Some(z), Some(alpha), Some(beta), Some(output))
                         }
                         _ => (None, None, None, None, None),
@@ -662,6 +680,30 @@ impl<'a> Transformer<'a> {
         let forward_started = profiler.as_ref().and_then(|p| p.start());
         if pos >= self.config.context_len {
             return Err("position exceeds configured context".into());
+        }
+
+        if self.config.is_qwen35 {
+            if let Some(cuda) = self.qwen35_cuda.as_ref().filter(|cuda| cuda.resident) {
+                let hidden = self.config.hidden_dim;
+                arena.reset();
+                let x = arena
+                    .alloc_slice::<f32>(hidden)
+                    .ok_or_else(|| "scratch arena is too small".to_string())?;
+                embedding(&self.weights.token_embedding, token as usize, x)?;
+                let selected = cuda.resident_forward_sample(
+                    x,
+                    pos,
+                    temperature,
+                    top_p,
+                    rng_seed,
+                )?;
+                record(
+                    &mut profiler,
+                    |profile| &mut profile.resident_cuda,
+                    forward_started,
+                );
+                return Ok(selected);
+            }
         }
 
         if let Some(cuda) = self.cuda.as_ref().filter(|c| c.resident) {
