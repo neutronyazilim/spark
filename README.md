@@ -2,7 +2,7 @@
 
 [Türkçe README](README_tr.md)
 
-`spark` is a CPU-first Rust LLM inference engine with CUDA support, implemented without heavyweight external ML libraries.
+`spark` is a Rust GGUF LLM inference engine with automatic CUDA acceleration and CPU fallback, implemented without heavyweight external ML libraries.
 
 The project currently supports GGUF model loading, Q8_0/Q4_0/Q1_0 and ternary GEMV kernels, CUDA GPU acceleration, Qwen2.5 and hybrid-attention Qwen3.5 forward passes, KV/recurrent caches, BPE tokenization from GGUF metadata, and autoregressive text generation.
 

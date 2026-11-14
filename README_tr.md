@@ -1,6 +1,6 @@
 # spark
 
-`spark`, harici ağır ML kütüphaneleri kullanmadan yazılan, CPU-first + CUDA destekli Rust LLM inference motorudur.
+`spark`, harici ağır ML kütüphaneleri kullanmadan yazılan, otomatik CUDA hızlandırmalı ve CPU fallback destekli bir Rust GGUF LLM inference motorudur.
 
 Proje şu anda GGUF model yükleme, Q8_0/Q4_0/Q1_0 ve ternary GEMV kernel'leri, CUDA GPU acceleration, Qwen2.5 ile hibrit-attention Qwen3.5 forward pass'leri, KV/recurrent cache, GGUF içinden BPE tokenizer ve autoregressive text generation desteğine sahiptir.
 
