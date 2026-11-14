@@ -1,0 +1,18 @@
+pkgbase = spark-llm-git
+	pkgdesc = CPU-first GGUF LLM inference engine with optional CUDA acceleration
+	pkgver = 0.1.0.r5.g273fe8e
+	pkgrel = 1
+	url = https://github.com/neutronyazilim/spark
+	arch = x86_64
+	license = MIT
+	makedepends = cargo
+	makedepends = git
+	depends = glibc
+	depends = libgcc
+	provides = spark-llm=0.1.0.r5.g273fe8e
+	conflicts = spark
+	conflicts = spark-llm
+	source = spark::git+https://github.com/neutronyazilim/spark.git
+	sha256sums = SKIP
+
+pkgname = spark-llm-git

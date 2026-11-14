@@ -9,7 +9,11 @@ use std::{
 use memmap2::Mmap;
 
 use spark::{
-    cli::{bench, chat, runtime::InferenceSession},
+    cli::{
+        bench, chat,
+        runtime::InferenceSession,
+        serve::{self, ServerConfig},
+    },
     loader::gguf::{GgufError, GgufModel},
     sampler::Sampler,
 };
@@ -18,6 +22,7 @@ enum Command {
     Run { prompt: String },
     Chat { max_tokens: usize },
     Bench,
+    Serve,
 }
 
 struct Arguments {
@@ -32,6 +37,10 @@ struct Arguments {
     gpu_layers: Option<usize>,
     raw: bool,
     profile: bool,
+    serve_host: String,
+    serve_port: u16,
+    api_key: Option<String>,
+    model_id: String,
 }
 
 fn parse_arguments() -> Result<Arguments, GgufError> {
@@ -42,6 +51,7 @@ fn parse_arguments() -> Result<Arguments, GgufError> {
         },
         Some("chat") => Command::Chat { max_tokens: 128 },
         Some("bench") => Command::Bench,
+        Some("serve" | "--serve") => Command::Serve,
         _ => return Err(usage()),
     };
     let model = args
@@ -57,6 +67,12 @@ fn parse_arguments() -> Result<Arguments, GgufError> {
     let mut gpu_layers = None;
     let mut raw = false;
     let mut profile = false;
+    let mut serve_host = "127.0.0.1".to_string();
+    let mut serve_port = 8080;
+    let mut api_key = env::var("SPARK_API_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let mut model_id = "spark-local".to_string();
 
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -102,6 +118,14 @@ fn parse_arguments() -> Result<Arguments, GgufError> {
                 gpu_layers = Some(value);
             }
             "--profile" => profile = true,
+            "--host" => serve_host = next_value(&mut args, "host")?,
+            "--port" => {
+                serve_port = next_value(&mut args, "port")?
+                    .parse()
+                    .map_err(|_| invalid("invalid server port"))?;
+            }
+            "--api-key" => api_key = Some(next_value(&mut args, "API key")?),
+            "--model-id" => model_id = next_value(&mut args, "model ID")?,
             "--help" | "-h" => return Err(usage()),
             unknown => return Err(invalid(format!("unknown argument {unknown}"))),
         }
@@ -126,6 +150,10 @@ fn parse_arguments() -> Result<Arguments, GgufError> {
         gpu_layers,
         raw,
         profile,
+        serve_host,
+        serve_port,
+        api_key,
+        model_id,
     })
 }
 
@@ -154,10 +182,11 @@ fn invalid(message: impl Into<String>) -> GgufError {
 
 fn usage() -> GgufError {
     invalid(
-        "usage: spark <run|chat|bench> <model.gguf> [options]\n\
+        "usage: spark <run|chat|bench|serve|--serve> <model.gguf> [options]\n\
          run:   -p \"prompt\" [-n 128] [--temp 0.7] [--top-p 0.9] [--top-k 40]\n\
          chat:  [-n 128] [--temp 0.7] [--top-p 0.9] [--top-k 40]\n\
          bench: [-n 128] [--temp 0.7] [--top-p 0.9] [--top-k 40]\n\
+         serve: [--host 127.0.0.1] [--port 8080] [--model-id spark-local] [--api-key KEY]\n\
          common: -t, --threads N [-ngl, --gpu-layers N] [--profile]",
     )
 }
@@ -195,6 +224,20 @@ fn run(arguments: Arguments) -> Result<(), GgufError> {
             arguments.repetition_penalty,
             arguments.max_tokens,
             arguments.profile,
+        ),
+        Command::Serve => serve::run(
+            &mut session,
+            ServerConfig {
+                host: arguments.serve_host,
+                port: arguments.serve_port,
+                api_key: arguments.api_key,
+                model_id: arguments.model_id,
+                max_tokens: arguments.max_tokens,
+                temperature: arguments.temperature,
+                top_p: arguments.top_p,
+                top_k: arguments.top_k,
+                repetition_penalty: arguments.repetition_penalty,
+            },
         ),
         Command::Run { prompt } => run_once(
             &mut session,

@@ -172,7 +172,14 @@ impl<'a> InferenceSession<'a> {
     }
 
     pub fn reset(&mut self) {
-        self.cache.clear();
+        let qwen35_resident = self
+            .transformer
+            .qwen35_cuda
+            .as_ref()
+            .is_some_and(|cuda| cuda.resident);
+        if !qwen35_resident {
+            self.cache.clear();
+        }
         if let Some(cuda) = &self.transformer.qwen35_cuda {
             let _ = cuda.clear_recurrent_state();
         }

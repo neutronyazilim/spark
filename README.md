@@ -1,64 +1,67 @@
 # spark
 
-`spark`, harici ağır ML kütüphaneleri kullanmadan yazılan, CPU-first + CUDA destekli Rust LLM inference motorudur.
+[Türkçe README](README_tr.md)
 
-Proje şu anda GGUF model yükleme, Q8_0/Q4_0/Q1_0 ve ternary GEMV kernel'leri, CUDA GPU acceleration, Qwen2.5 ile hibrit-attention Qwen3.5 forward pass'leri, KV/recurrent cache, GGUF içinden BPE tokenizer ve autoregressive text generation desteğine sahiptir.
+`spark` is a CPU-first Rust LLM inference engine with CUDA support, implemented without heavyweight external ML libraries.
 
-## Özellikler
+The project currently supports GGUF model loading, Q8_0/Q4_0/Q1_0 and ternary GEMV kernels, CUDA GPU acceleration, Qwen2.5 and hybrid-attention Qwen3.5 forward passes, KV/recurrent caches, BPE tokenization from GGUF metadata, and autoregressive text generation.
 
-- GGUF v2/v3 header, metadata ve tensor parser
-- `mmap` üzerinden zero-copy model ağırlığı erişimi
-- Q8_0 ve Q4_0 on-the-fly dequantization
-- Ternary (BitNet tarzı) ağırlık desteği:
-  - Q2_0 / 2-bit ternary blok formatı (32 ağırlık / 10 bayt)
-  - Prism ML / BitNet PTQ1_0 formatı (128 ağırlık / 28 bayt, 1.75 bpw)
-- GGML Q1_0 bipolar formatı (128 ağırlık / 18 bayt, 1.125 bpw)
-- Scalar, AVX ve AVX2/FMA GEMV kernel'leri
+## Features
+
+- GGUF v2/v3 header, metadata, and tensor parser
+- Zero-copy model-weight access through `mmap`
+- On-the-fly Q8_0 and Q4_0 dequantization
+- Ternary (BitNet-style) weight support:
+  - Q2_0 / 2-bit ternary block format (32 weights / 10 bytes)
+  - Prism ML / BitNet PTQ1_0 format (128 weights / 28 bytes, 1.75 bpw)
+- GGML Q1_0 bipolar format (128 weights / 18 bytes, 1.125 bpw)
+- Scalar, AVX, and AVX2/FMA GEMV kernels
 - Runtime CPU feature dispatch
-- CUDA backend (harici kütüphane olmadan, `dlopen` ile CUDA Driver API):
-  - `kernels/gemv.ptx` içindeki elle yazılmış PTX kernel'ları runtime'da yüklenir
-  - Q8_0/Q4_0/Q1_0/PTQ1_0 GEMV, fused QKV ve fused FFN kernel'ları
-  - Q1_0 için Q8 aktivasyon + `dp4a`, çoklu projection batching ve iki-row/warp kernel
-  - GPU üzerinde argmax ve top-64 sampling
-  - Hibrit katman offloading (`-ngl/--gpu-layers`): VRAM'e sığan katman sayısı otomatik hesaplanır, kalan katmanlar CPU'da çalışır
-  - `SPARK_NO_CUDA=1` ile devre dışı bırakılabilir; CUDA başlatılamazsa otomatik CPU'ya düşer
-- Arena tabanlı scratch buffer
-- Qwen2/Qwen2.5 transformer blokları
-- Qwen3.5/Qwen35 hibrit mimarisi:
-  - 4-tap causal convolution + Gated DeltaNet recurrent katmanları
-  - Gated full attention, head-wise Q/K RMSNorm ve text MRoPE
-  - Ayrı KV-cache ve recurrent-state cache
-- Q/K/V bias destekli attention
+- CUDA backend (CUDA Driver API loaded through `dlopen`, with no external libraries):
+  - Handwritten PTX kernels in `kernels/gemv.ptx` are loaded at runtime
+  - Q8_0/Q4_0/Q1_0/PTQ1_0 GEMV, fused QKV, and fused FFN kernels
+  - Q8 activation + `dp4a`, multi-projection batching, and two-row/warp kernel for Q1_0
+  - GPU-based argmax and top-64 sampling
+  - Hybrid layer offloading (`-ngl/--gpu-layers`): the number of layers that fit in VRAM is calculated automatically, and the remaining layers run on the CPU
+  - Can be disabled with `SPARK_NO_CUDA=1`; automatically falls back to the CPU if CUDA initialization fails
+- Arena-based scratch buffer
+- Qwen2/Qwen2.5 transformer blocks
+- Qwen3.5/Qwen35 hybrid architecture:
+  - 4-tap causal convolution + Gated DeltaNet recurrent layers
+  - Gated full attention, head-wise Q/K RMSNorm, and text MRoPE
+  - Separate KV cache and recurrent-state cache
+- Attention with Q/K/V bias support
 - Grouped Query Attention (GQA)
-- RoPE, RMSNorm, Softmax ve SwiGLU
-- Önceden tahsis edilen KV-cache
-- GGUF tokenizer metadata'sından minimal BPE tokenizer
-- Temperature, Top-K, Top-P ve repetition penalty sampling
-- Streaming terminal çıktısı
-- Kalıcı worker thread pool ile statik GEMV satır bölüşümü
-- ANSI terminal arayüzü ve interaktif çok turlu sohbet modu
+- RoPE, RMSNorm, Softmax, and SwiGLU
+- Preallocated KV cache
+- Minimal BPE tokenizer using GGUF tokenizer metadata
+- Temperature, Top-K, Top-P, and repetition-penalty sampling
+- Streaming terminal output
+- OpenAI-compatible HTTP API: Chat Completions, SSE streaming, bearer authentication, and tool calls
+- Static GEMV row partitioning with a persistent worker thread pool
+- ANSI terminal interface and interactive multi-turn chat mode
 
-## Gereksinimler
+## Requirements
 
-- Rust stable toolchain
-- x86-64 CPU önerilir
-- AVX/AVX2 destekli CPU'larda SIMD kernel'leri otomatik seçilir
-- GGUF formatında Qwen2/Qwen2.5 veya Qwen3.5/Qwen35 modeli
-- CUDA desteği için: NVIDIA GPU + kurulu sürücü (`libcuda.so.1`); ayrıca CUDA Toolkit gerekmez (PTX runtime'da JIT derlenir)
+- Stable Rust toolchain
+- An x86-64 CPU is recommended
+- SIMD kernels are selected automatically on CPUs with AVX/AVX2 support
+- A Qwen2/Qwen2.5 or Qwen3.5/Qwen35 model in GGUF format
+- For CUDA support: an NVIDIA GPU and installed driver (`libcuda.so.1`); the CUDA Toolkit is not required (PTX is JIT-compiled at runtime)
 
-## Derleme
+## Building
 
 ```bash
 cargo build --release
 ```
 
-## Kullanım
+## Usage
 
-Qwen2.5 GGUF modeliyle prompt çalıştırma:
+Run a prompt with a Qwen2.5 GGUF model:
 
 ```bash
 cargo run --release -- run ./qwen2.5-0.5b-instruct-q8_0.gguf \
-  -p "Merhaba, nasılsın?" \
+  -p "Hello, how are you?" \
   -n 128 \
   --temp 0.7 \
   --top-k 40 \
@@ -67,42 +70,42 @@ cargo run --release -- run ./qwen2.5-0.5b-instruct-q8_0.gguf \
   --threads 8
 ```
 
-CUDA GPU ile (hibrit katman offloading otomatik):
+With a CUDA GPU (hybrid layer offloading is automatic):
 
 ```bash
-./target/release/spark run ./model.gguf -p "Merhaba" -n 128 --threads 8
+./target/release/spark run ./model.gguf -p "Hello" -n 128 --threads 8
 ```
 
-- VRAM'e sığan katmanlar GPU'ya yüklenir, kalanlar CPU'da çalışır.
-- `-ngl/--gpu-layers N` ile offload edilecek katman sayısı elle belirtilebilir.
-- `SPARK_NO_CUDA=1` CUDA'yı tamamen devre dışı bırakır.
+- Layers that fit in VRAM are loaded onto the GPU; the remaining layers run on the CPU.
+- Use `-ngl/--gpu-layers N` to specify the number of layers to offload manually.
+- `SPARK_NO_CUDA=1` disables CUDA completely.
 
-Qwen3.5 27B Q1_0 örneği:
+Qwen3.5 27B Q1_0 example:
 
 ```bash
 ./target/release/spark run ~/Downloads/Bonsai-27B-Q1_0.gguf \
-  -p "Merhaba" -n 64 --temp 0 --threads 8
+  -p "Hello" -n 64 --temp 0 --threads 8
 ```
 
-Qwen3.5 Q1_0 modelde katman bütçesi, ölçek biçimi ve LM head VRAM'e göre
-otomatik seçilir. 4 GB GPU'larda 64 katmanın tamamı, LM head, Gated DeltaNet
-durumu ve 1024 token'a kadar attention cache VRAM'de tutulur. Aktivasyon
-quantization, causal convolution, recurrent update, attention, FFN ve sampling
-aynı CUDA stream'i üzerinde çalışır; decode sırasında katman başına CPU/GPU
-kopyası yapılmaz.
+For Qwen3.5 Q1_0 models, the layer budget, scale format, and LM head are selected
+automatically according to available VRAM. On 4 GB GPUs, all 64 layers, the LM
+head, Gated DeltaNet state, and attention cache for up to 1024 tokens reside in
+VRAM. Activation quantization, causal convolution, recurrent updates, attention,
+FFN, and sampling run on the same CUDA stream; there are no per-layer CPU/GPU
+copies during decoding.
 
-Bu depodaki `Bonsai-27B-Q1_0.gguf` ile RTX 3050 Laptop 4 GB üzerinde ölçülen
-örnek sonuç (32 decode token, greedy):
+Example result measured on an RTX 3050 Laptop 4 GB with the
+`Bonsai-27B-Q1_0.gguf` model in this repository (32 decode tokens, greedy):
 
 ```text
 prefill: 15 tokens, 19.34 tok/s
 decode: 32 tokens, 19.47 tok/s
 ```
 
-4 GB kartlarda varsayılan resident mod, Q1 blok ölçeklerini matris başına 10
-bit'e sıkıştırır. Bu, 1024 token GPU cache'in sığmasını sağlar. Yeterli boş VRAM
-yoksa cache boyutu otomatik olarak yarıya indirilir. Daha yüksek hız
-ve orijinal FP16 ölçekleri birebir korumak için daha kısa cache ile:
+On 4 GB GPUs, the default resident mode compresses Q1 block scales to 10 bits
+per matrix. This allows the 1024-token GPU cache to fit. If there is not enough
+free VRAM, the cache size is automatically halved. For higher speed while
+preserving the original FP16 scales exactly, use a shorter cache:
 
 ```bash
 SPARK_Q1_EXACT_SCALES=1 SPARK_QWEN35_GPU_CONTEXT=64 \
@@ -110,21 +113,22 @@ SPARK_Q1_EXACT_SCALES=1 SPARK_QWEN35_GPU_CONTEXT=64 \
   -n 32 --temp 0 --threads 8
 ```
 
-Bu mod aynı kartta yaklaşık `26.5 tok/s` decode üretir. Kullanılabilir VRAM'e
-göre `SPARK_QWEN35_GPU_CONTEXT` artırılabilir; fazla büyük değer CUDA allocation
-hatasına yol açarsa değeri düşürün. `SPARK_NO_QWEN35_RESIDENT=1` eski hibrit
-yolu, `SPARK_Q1_HYBRID=1` ise konservatif kısmi katman offload'unu zorlar.
+This mode delivers approximately `26.5 tok/s` decoding on the same GPU.
+`SPARK_QWEN35_GPU_CONTEXT` can be increased according to available VRAM; lower
+the value if an excessively large setting causes a CUDA allocation error.
+`SPARK_NO_QWEN35_RESIDENT=1` forces the old hybrid path, while
+`SPARK_Q1_HYBRID=1` forces conservative partial layer offloading.
 
-Derlenmiş binary ile:
+Using the compiled binary:
 
 ```bash
 ./target/release/spark run ./qwen2.5-0.5b-instruct-q8_0.gguf \
-  --prompt "Rust nedir?" \
+  --prompt "What is Rust?" \
   --max-tokens 64 \
   --temperature 0.0
 ```
 
-İnteraktif sohbet:
+Interactive chat:
 
 ```bash
 ./target/release/spark chat ./qwen2.5-0.5b-instruct-q8_0.gguf \
@@ -132,55 +136,152 @@ Derlenmiş binary ile:
   --threads 8
 ```
 
-Sohbetten `exit`, `quit` veya `Ctrl+D` ile çıkılır. Önceki turlar aynı KV-cache
-üzerinde tutulur; context sınırı dolduğunda motor uyarı verip yeni bir sohbet
-cache'i başlatır.
+Exit the chat with `exit`, `quit`, or `Ctrl+D`. Previous turns are retained in
+the same KV cache; when the context limit is reached, the engine displays a
+warning and starts a new chat cache.
 
-Saf generation benchmark'ı:
+### OpenAI-compatible HTTP API
+
+`serve` or `--serve` loads the model once and starts an OpenAI
+Chat Completions-compatible HTTP server:
+
+```bash
+SPARK_API_KEY=local-dev-key \
+  ./target/release/spark --serve ~/Downloads/Bonsai-27B-Q1_0.gguf \
+  --host 127.0.0.1 --port 8080 --model-id bonsai-27b \
+  --max-tokens 256 --threads 8
+```
+
+Authentication is disabled if neither `SPARK_API_KEY` nor `--api-key` is
+provided. The server clears its GPU recurrent/KV state at the start of every
+stateless API request and processes inference requests sequentially. Supported
+endpoints and features:
+
+- `GET /health` and `GET /v1/health`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- Regular JSON and `stream: true` SSE responses
+- OpenAI `tools` / `tool_calls`; XML calls from the Qwen GGUF tool template are
+  converted into OpenAI function-call objects
+
+In API mode, the Qwen thinking block is disabled by default, allowing short
+responses and tool calls to complete without consuming the output budget. Send
+`"enable_thinking": true` in a request to enable it again.
+
+Quick test:
+
+```bash
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Authorization: Bearer local-dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "bonsai-27b",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": false,
+    "max_tokens": 64
+  }'
+```
+
+Project or global `opencode.jsonc` configuration for OpenCode V2:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "spark/bonsai-27b",
+  "providers": {
+    "spark": {
+      "name": "Spark Local",
+      "env": ["SPARK_API_KEY"],
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:8080/v1",
+        "apiKey": "{env:SPARK_API_KEY}"
+      },
+      "models": {
+        "bonsai-27b": {
+          "name": "Bonsai 27B Q1_0",
+          "body": {
+            "enable_thinking": false
+          },
+          "capabilities": {
+            "tools": true,
+            "input": ["text"],
+            "output": ["text"]
+          },
+          "compatibility": {
+            "reasoningField": "reasoning_content",
+            "maxTokensField": "max_tokens",
+            "streamUsage": true
+          },
+          "limit": {
+            "context": 1024,
+            "output": 256
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+Start OpenCode with the same key as the server:
+`SPARK_API_KEY=local-dev-key opencode`. If you do not want authentication,
+remove the key from the server as well as the `apiKey` and `env` lines from the
+configuration. If OpenCode's large system prompt and tool schemas exceed the
+1024-token context limit on a 4 GB GPU, Spark automatically compacts the prompt
+while retaining a concise coding-agent instruction, essential tools, and the
+most recent messages. Use `SPARK_NO_PROMPT_COMPACTION=1` to disable this
+behavior. If more VRAM is available, increase `SPARK_QWEN35_GPU_CONTEXT`.
+
+Pure generation benchmark:
 
 ```bash
 ./target/release/spark bench ./qwen2.5-0.5b-instruct-q8_0.gguf \
   --threads 8
 ```
 
-`run` ve `bench` komutlarında `--profile`, ilk 10 decode token'ı için
-operatör bazlı mikro-profilleme tablosu üretir:
+For the `run` and `bench` commands, `--profile` produces an operator-level
+microprofiling table for the first 10 decoded tokens:
 
 ```bash
 ./target/release/spark run ./qwen2.5-0.5b-instruct-q8_0.gguf \
-  -p "Kısa bir şaka anlat." -n 10 --temp 0 --threads 8 --profile
+  -p "Tell me a short joke." -n 10 --temp 0 --threads 8 --profile
 
 ./target/release/spark bench ./qwen2.5-0.5b-instruct-q8_0.gguf \
   --threads 8 --profile
 ```
 
-Tablo RMSNorm, QKV/FFN/output GEMV, RoPE-attention, SwiGLU ve thread-pool
-dispatch bekleme sürelerini gösterir. Profilleme varsayılan olarak kapalıdır;
-normal çalıştırmada ek zaman ölçümü yapılmaz.
+The table shows RMSNorm, QKV/FFN/output GEMV, RoPE-attention, SwiGLU, and
+thread-pool dispatch wait times. Profiling is disabled by default, so no
+additional timing measurements are performed during normal execution.
 
-### CLI seçenekleri
+### CLI options
 
-| Seçenek | Açıklama | Varsayılan |
+| Option | Description | Default |
 |---|---|---:|
-| `run <model.gguf>` | GGUF model yolunu belirtir | Zorunlu |
-| `-p`, `--prompt` | Girdi prompt'u | Zorunlu |
-| `-n`, `--max-tokens` | Üretilecek maksimum token sayısı | `128` |
-| `--temp`, `--temperature` | Temperature; `0.0` greedy argmax kullanır | `0.7` |
-| `--top-k` | Sampling aday havuzunun boyutu | `40` |
-| `--top-p` | Nucleus sampling eşiği | `0.9` |
-| `--repeat-penalty` | Son 64 üretilen token için tekrar cezası | `1.1` |
-| `-t`, `--threads` | GEMV worker thread sayısı | CPU paralellik seviyesi |
-| `-ngl`, `--gpu-layers` | GPU'ya yüklenecek katman sayısı (CUDA aktifse) | VRAM'e göre otomatik |
-| `--profile` | İlk 10 decode token'ı için operatör profili (`run`, `bench`) | Kapalı |
+| `run <model.gguf>` | Specifies the path to the GGUF model | Required |
+| `serve`, `--serve <model.gguf>` | Starts the OpenAI-compatible HTTP API | — |
+| `-p`, `--prompt` | Input prompt | Required |
+| `-n`, `--max-tokens` | Maximum number of tokens to generate | `128` |
+| `--temp`, `--temperature` | Temperature; `0.0` uses greedy argmax | `0.7` |
+| `--top-k` | Size of the sampling candidate pool | `40` |
+| `--top-p` | Nucleus sampling threshold | `0.9` |
+| `--repeat-penalty` | Repetition penalty for the last 64 generated tokens | `1.1` |
+| `-t`, `--threads` | Number of GEMV worker threads | CPU parallelism level |
+| `-ngl`, `--gpu-layers` | Number of layers loaded onto the GPU (when CUDA is active) | Automatic based on VRAM |
+| `--profile` | Operator profile for the first 10 decoded tokens (`run`, `bench`) | Disabled |
+| `--host`, `--port` | HTTP bind address and port (`serve`) | `127.0.0.1:8080` |
+| `--model-id` | Model identifier exposed by the API | `spark-local` |
+| `--api-key` | Bearer API key; `SPARK_API_KEY` can also be used | Disabled |
 
-`-t`/`--threads` ve `--temp` seçenekleri `run`, `chat` ve `bench`
-komutlarında ortaktır.
+The `-t`/`--threads` and `--temp` options are shared by the `run`, `chat`,
+`bench`, and `serve` commands.
 
-Örnek temperature/top-p kullanımı:
+Example temperature/top-p usage:
 
 ```bash
 cargo run --release -- run model.gguf \
-  -p "Kısa bir şiir yaz." \
+  -p "Write a short poem." \
   -n 64 \
   --temp 0.7 \
   --top-k 40 \
@@ -188,13 +289,13 @@ cargo run --release -- run model.gguf \
   --repeat-penalty 1.1
 ```
 
-Generation tamamlandığında prefill ve generation hızları yazdırılır:
+Prefill and generation speeds are printed when generation completes:
 
 ```text
 [prefill: 4 tokens, 8.30 tok/s | generation: 32 tokens, 18.06 tok/s]
 ```
 
-## Mimari
+## Architecture
 
 ```text
 GGUF file
@@ -208,18 +309,18 @@ mmap + GGUF parser
    v
 CUDA backend?                    CPU backend
    |                                |
-   +--> PTX kernel'lar (Q8/Q4/      +--> scalar/AVX/AVX2 GEMV
+   +--> PTX kernels (Q8/Q4/         +--> scalar/AVX/AVX2 GEMV
    |    PTQ1 GEMV, fused QKV,       |    + thread pool
    |    fused FFN, argmax,          |
    |    top-64 sampling)            |
    |                                |
    v                                v
-Qwen2 veya Qwen35 transformer (hibrit: GPU katmanları + CPU/recurrent işlemler)
+Qwen2 or Qwen35 transformer (hybrid: GPU layers + CPU/recurrent operations)
    |
    +--> RMSNorm
    +--> Q/K/V projections
    +--> RoPE + GQA attention
-   +--> KV-cache
+   +--> KV cache
    +--> SwiGLU FFN
    +--> output projection
    |
@@ -227,11 +328,15 @@ Qwen2 veya Qwen35 transformer (hibrit: GPU katmanları + CPU/recurrent işlemler
 logits --> sampler --> token decode --> streaming stdout
 ```
 
-`forward_token` sırasında ara aktivasyonlar arena üzerinden alınır. Quantized ağırlıklar önceden FP32 buffer'ına açılmaz; dequantization dot-product sırasında yapılır. GPU'ya yüklenen katmanlarda ağırlıklar quantize halleriyle VRAM'e kopyalanır, dequantization CUDA kernel'ı içinde yapılır.
+During `forward_token`, intermediate activations are allocated from the arena.
+Quantized weights are not expanded into an FP32 buffer ahead of time;
+dequantization occurs during the dot product. For GPU-loaded layers, weights are
+copied to VRAM in their quantized form, and dequantization occurs inside the
+CUDA kernel.
 
-## Test ve benchmark
+## Tests and benchmarks
 
-Testleri çalıştırmak için:
+Run the tests with:
 
 ```bash
 cargo test
@@ -243,46 +348,47 @@ Lint:
 cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-GEMV benchmark'ını derlemek veya çalıştırmak için:
+Build or run the GEMV benchmark with:
 
 ```bash
 cargo bench --bench gemv
 ```
 
-## Mevcut kapsam ve sınırlamalar
+## Current scope and limitations
 
-- Qwen2/Qwen2.5 Q8_0 ve Qwen35 Q1_0 yolları end-to-end doğrulanmıştır; Q2_0/PTQ1_0 CUDA GEMV'leri sentetik CPU referans testlerine sahiptir.
-- Tokenizer, GGUF içindeki vocab ve merge metadata'sını kullanır.
-- Qwen2.5 Instruct için prompt otomatik olarak ChatML formatına sarılır:
+- The Qwen2/Qwen2.5 Q8_0 and Qwen35 Q1_0 paths have been validated end to end; the Q2_0/PTQ1_0 CUDA GEMV kernels have synthetic CPU reference tests.
+- The tokenizer uses vocabulary and merge metadata from the GGUF file.
+- For Qwen2.5 Instruct, the prompt is automatically wrapped in ChatML format:
   `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
-- Qwen35 için model template'inin generation eki (`<think>\n`) ve GGUF control
-  token tipleri otomatik uygulanır.
-- `spark chat` oturumu KV-cache'i turlar arasında korur ve yanıtları ANSI
-  renkleriyle akış halinde yazdırır.
-- Forward pass arena kullanır; tokenizer encode/decode ve temperature sampling tarafında normal Rust `Vec` kullanımı devam eder.
-- Model yükleme sırasında metadata, tensor tanımları ve layer weight binding tabloları oluşturulur.
-- CUDA: sürücü (`libcuda.so.1`) + NVIDIA GPU gerekir, CUDA Toolkit gerekmez.
-  PTX modülü runtime'da yüklenir; başlatma başarısız olursa sessizce CPU'ya düşülür.
-- Qwen35 Q1_0 offload yolu aynı aktivasyonu kullanan projection'ları tek H2D/D2H
-  turunda batch eder. Recurrent state varsayılan olarak bit-kararlı CPU yolunda
-  tutulur; deneysel GPU Gated DeltaNet `SPARK_GDN_CUDA=1` ile açılabilir.
-- GEMV worker thread'leri model başlangıcında bir kez oluşturulur; token
-  üretimi sırasında yeni thread spawn edilmez.
-- Metal ve harici ONNX/PyTorch/Candle entegrasyonu yoktur.
+- For Qwen35, the model template's generation suffix (`<think>\n`) and GGUF
+  control-token types are applied automatically.
+- A `spark chat` session retains its KV cache between turns and streams
+  responses with ANSI colors.
+- The forward pass uses the arena; tokenizer encoding/decoding and temperature sampling still use regular Rust `Vec` allocations.
+- Metadata, tensor definitions, and layer-weight binding tables are created while the model is loaded.
+- CUDA requires an NVIDIA GPU and driver (`libcuda.so.1`), but not the CUDA Toolkit.
+  The PTX module is loaded at runtime; initialization failures silently fall back to the CPU.
+- The Qwen35 Q1_0 offload path batches projections that share the same activation
+  into a single H2D/D2H round trip. By default, recurrent state is maintained on
+  the bit-stable CPU path; experimental GPU Gated DeltaNet can be enabled with
+  `SPARK_GDN_CUDA=1`.
+- GEMV worker threads are created once during model initialization; no new
+  threads are spawned during token generation.
+- There is no Metal or external ONNX/PyTorch/Candle integration.
 
-## Paketleme
+## Packaging
 
-Debian paketi için `cargo-deb` kurup:
+For a Debian package, install `cargo-deb` and run:
 
 ```bash
 cargo build --release
 cargo deb
 ```
 
-komutlarını çalıştırın. Arch Linux/AUR için kökteki `PKGBUILD` dosyası
-`spark-llm-git` paketini `/usr/bin/spark` olarak kurar.
+For Arch Linux/AUR, the root `PKGBUILD` installs the `spark-llm-git` package as
+`/usr/bin/spark`.
 
-## Lisans
+## License
 
-Bu proje [MIT Lisansı](LICENSE) altında sunulur. Model dosyalarının lisansını ve
-dağıtım koşullarını ayrıca kontrol edin.
+This project is provided under the [MIT License](LICENSE). Check model files'
+licenses and distribution terms separately.
