@@ -1,0 +1,20 @@
+[package]
+name = "spark"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+
+[[bench]]
+name = "gemv"
+harness = false
+
+[package.metadata.deb]
+maintainer = "spark contributors"
+copyright = "Copyright 2026 spark contributors"
+section = "science"
+priority = "optional"
+assets = [
+    ["target/release/spark", "usr/bin/spark", "755"],
+]

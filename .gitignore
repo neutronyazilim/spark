@@ -1,0 +1,13 @@
+target/
+build/
+dist/
+out/
+*.o
+*.out
+*.bin
+*.elf
+*.so
+*.a
+*.gguf
+.env
+*.ptx
