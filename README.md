@@ -284,4 +284,5 @@ komutlarını çalıştırın. Arch Linux/AUR için kökteki `PKGBUILD` dosyası
 
 ## Lisans
 
-Bu depo için lisans belirtilmemiştir. Model dosyalarının lisansını ve dağıtım koşullarını ayrıca kontrol edin.
+Bu proje [MIT Lisansı](LICENSE) altında sunulur. Model dosyalarının lisansını ve
+dağıtım koşullarını ayrıca kontrol edin.

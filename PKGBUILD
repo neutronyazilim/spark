@@ -4,7 +4,7 @@ pkgrel=1
 pkgdesc='Minimal CPU-first GGUF LLM inference engine written in Rust'
 arch=('x86_64')
 url='https://github.com/deniz/spark'
-license=('custom')
+license=('MIT')
 depends=('gcc-libs')
 makedepends=('cargo' 'git')
 provides=('spark')
@@ -26,4 +26,5 @@ package() {
   cd "$srcdir/spark"
   install -Dm755 target/release/spark "$pkgdir/usr/bin/spark"
   install -Dm644 README.md "$pkgdir/usr/share/doc/spark/README.md"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
