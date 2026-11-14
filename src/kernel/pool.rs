@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::{q4_0::BlockQ4_0, q8_0::BlockQ8_0};
+use super::{q1_0::BlockQ1_0, q4_0::BlockQ4_0, q8_0::BlockQ8_0};
 use crate::profile::ProfileStats;
 
 #[repr(align(64))]
@@ -65,11 +65,28 @@ pub struct FusedFfnJob {
 }
 
 #[derive(Clone, Copy)]
+pub struct GatedDeltaJob {
+    pub q: usize,
+    pub k: usize,
+    pub v: usize,
+    pub gate: usize,
+    pub beta: usize,
+    pub state: usize,
+    pub output: usize,
+    pub key_heads: usize,
+    pub value_heads: usize,
+    pub head_dim: usize,
+    pub use_avx2: bool,
+}
+
+#[derive(Clone, Copy)]
 enum TaskKind {
     None,
     Q8(SingleGemvJob),
     Q4(SingleGemvJob),
     PTQ1(SingleGemvJob),
+    Q1(SingleGemvJob),
+    GatedDelta(GatedDeltaJob),
     FusedQkv(FusedQkvJob),
     FusedFfn(FusedFfnJob),
 }
@@ -219,6 +236,27 @@ impl ThreadPool {
         );
     }
 
+    pub fn gemv_q1_0(
+        &self,
+        weights: &[BlockQ1_0],
+        activations: &[BlockQ8_0],
+        output: &mut [f32],
+        columns: usize,
+        profile: Option<&mut ProfileStats>,
+    ) {
+        self.dispatch(
+            TaskKind::Q1(SingleGemvJob {
+                weights: weights.as_ptr() as usize,
+                input: activations.as_ptr() as usize,
+                output: output.as_mut_ptr() as usize,
+                blocks: weights.len(),
+                rows: output.len(),
+                blocks_per_row: columns / 128,
+            }),
+            profile,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_qkv_q8_0(
         &self,
@@ -269,6 +307,39 @@ impl ThreadPool {
                 blocks_per_row: columns / 32,
             }),
             profile,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_step(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        gate: &[f32],
+        beta: &[f32],
+        state: &mut [f32],
+        output: &mut [f32],
+        key_heads: usize,
+        value_heads: usize,
+        head_dim: usize,
+        use_avx2: bool,
+    ) {
+        self.dispatch(
+            TaskKind::GatedDelta(GatedDeltaJob {
+                q: q.as_ptr() as usize,
+                k: k.as_ptr() as usize,
+                v: v.as_ptr() as usize,
+                gate: gate.as_ptr() as usize,
+                beta: beta.as_ptr() as usize,
+                state: state.as_mut_ptr() as usize,
+                output: output.as_mut_ptr() as usize,
+                key_heads,
+                value_heads,
+                head_dim,
+                use_avx2,
+            }),
+            None,
         );
     }
 
@@ -433,6 +504,69 @@ fn execute_task(task: Task, worker_index: usize, workers: usize) {
                     );
                 }
             }
+            TaskKind::Q1(job) => {
+                let start = job.rows * worker_index / workers;
+                let end = job.rows * (worker_index + 1) / workers;
+                if start < end {
+                    let weights =
+                        std::slice::from_raw_parts(job.weights as *const BlockQ1_0, job.blocks);
+                    let input = std::slice::from_raw_parts(
+                        job.input as *const BlockQ8_0,
+                        job.blocks_per_row * 4,
+                    );
+                    let output = std::slice::from_raw_parts_mut(job.output as *mut f32, job.rows);
+                    super::q1_0::gemv_q1_0_q8_0_rows(
+                        &weights[start * job.blocks_per_row..end * job.blocks_per_row],
+                        input,
+                        &mut output[start..end],
+                        job.blocks_per_row,
+                    );
+                }
+            }
+            TaskKind::GatedDelta(job) => {
+                let head_start = job.value_heads * worker_index / workers;
+                let head_end = job.value_heads * (worker_index + 1) / workers;
+                if head_start < head_end {
+                    let q = std::slice::from_raw_parts(
+                        job.q as *const f32,
+                        job.key_heads * job.head_dim,
+                    );
+                    let k = std::slice::from_raw_parts(
+                        job.k as *const f32,
+                        job.key_heads * job.head_dim,
+                    );
+                    let v = std::slice::from_raw_parts(
+                        job.v as *const f32,
+                        job.value_heads * job.head_dim,
+                    );
+                    let gate = std::slice::from_raw_parts(job.gate as *const f32, job.value_heads);
+                    let beta = std::slice::from_raw_parts(job.beta as *const f32, job.value_heads);
+                    let local_heads = head_end - head_start;
+                    let state = std::slice::from_raw_parts_mut(
+                        (job.state as *mut f32)
+                            .add(head_start * job.head_dim * job.head_dim),
+                        local_heads * job.head_dim * job.head_dim,
+                    );
+                    let output = std::slice::from_raw_parts_mut(
+                        (job.output as *mut f32).add(head_start * job.head_dim),
+                        local_heads * job.head_dim,
+                    );
+                    run_gated_delta_heads(
+                        q,
+                        k,
+                        v,
+                        gate,
+                        beta,
+                        state,
+                        output,
+                        job.key_heads,
+                        job.head_dim,
+                        head_start,
+                        head_end,
+                        job.use_avx2,
+                    );
+                }
+            }
             TaskKind::FusedQkv(job) => {
                 let total_rows = job.q_rows + job.k_rows + job.v_rows;
                 let start = total_rows * worker_index / workers;
@@ -533,6 +667,127 @@ fn execute_task(task: Task, worker_index: usize, workers: usize) {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_gated_delta_heads(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    gate: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    output: &mut [f32],
+    key_heads: usize,
+    head_dim: usize,
+    head_start: usize,
+    head_end: usize,
+    prefer_avx2: bool,
+) {
+    let scale = (head_dim as f32).sqrt().recip();
+    let use_avx2 = prefer_avx2
+        && std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+        && head_dim.is_multiple_of(8);
+    for (local_head, value_head) in (head_start..head_end).enumerate() {
+        let key_head = value_head % key_heads;
+        let qh = &q[key_head * head_dim..(key_head + 1) * head_dim];
+        let kh = &k[key_head * head_dim..(key_head + 1) * head_dim];
+        let vh = &v[value_head * head_dim..(value_head + 1) * head_dim];
+        let oh = &mut output[local_head * head_dim..(local_head + 1) * head_dim];
+        let decay = gate[value_head].exp();
+        let state_head = &mut state
+            [local_head * head_dim * head_dim..(local_head + 1) * head_dim * head_dim];
+        if use_avx2 {
+            unsafe {
+                gated_delta_head_avx2(qh, kh, vh, decay, beta[value_head], state_head, oh, scale);
+            }
+            continue;
+        }
+        for col in 0..head_dim {
+            let column = &mut state_head[col * head_dim..(col + 1) * head_dim];
+            let mut kv = 0.0f32;
+            for i in 0..head_dim {
+                kv = column[i].mul_add(kh[i], kv);
+            }
+            let delta = (vh[col] - decay * kv) * beta[value_head];
+            let mut attn = 0.0f32;
+            for i in 0..head_dim {
+                column[i] = kh[i].mul_add(delta, decay * column[i]);
+                attn = column[i].mul_add(qh[i], attn);
+            }
+            oh[col] = attn * scale;
+        }
+    }
+}
+
+/// # Safety
+/// Caller must ensure AVX2/FMA support and lengths divisible by eight.
+#[target_feature(enable = "avx2,fma")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn gated_delta_head_avx2(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    decay: f32,
+    beta: f32,
+    state: &mut [f32],
+    output: &mut [f32],
+    output_scale: f32,
+) {
+    use std::arch::x86_64::*;
+
+    let n = q.len();
+    let decay_v = _mm256_set1_ps(decay);
+    for col in 0..n {
+        let column = state.as_mut_ptr().add(col * n);
+        let mut kv0 = _mm256_setzero_ps();
+        let mut kv1 = _mm256_setzero_ps();
+        for i in (0..n).step_by(16) {
+            kv0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(column.add(i)),
+                _mm256_loadu_ps(k.as_ptr().add(i)),
+                kv0,
+            );
+            kv1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(column.add(i + 8)),
+                _mm256_loadu_ps(k.as_ptr().add(i + 8)),
+                kv1,
+            );
+        }
+        let kv = hsum256(_mm256_add_ps(kv0, kv1));
+        let delta_v = _mm256_set1_ps((v[col] - decay * kv) * beta);
+        let mut out0 = _mm256_setzero_ps();
+        let mut out1 = _mm256_setzero_ps();
+        for i in (0..n).step_by(16) {
+            let s0 = _mm256_loadu_ps(column.add(i));
+            let s1 = _mm256_loadu_ps(column.add(i + 8));
+            let new0 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(k.as_ptr().add(i)),
+                delta_v,
+                _mm256_mul_ps(s0, decay_v),
+            );
+            let new1 = _mm256_fmadd_ps(
+                _mm256_loadu_ps(k.as_ptr().add(i + 8)),
+                delta_v,
+                _mm256_mul_ps(s1, decay_v),
+            );
+            _mm256_storeu_ps(column.add(i), new0);
+            _mm256_storeu_ps(column.add(i + 8), new1);
+            out0 = _mm256_fmadd_ps(new0, _mm256_loadu_ps(q.as_ptr().add(i)), out0);
+            out1 = _mm256_fmadd_ps(new1, _mm256_loadu_ps(q.as_ptr().add(i + 8)), out1);
+        }
+        output[col] = hsum256(_mm256_add_ps(out0, out1)) * output_scale;
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256(value: std::arch::x86_64::__m256) -> f32 {
+    use std::arch::x86_64::*;
+    let sum = _mm_add_ps(_mm256_castps256_ps128(value), _mm256_extractf128_ps(value, 1));
+    let sum = _mm_hadd_ps(sum, sum);
+    let sum = _mm_hadd_ps(sum, sum);
+    _mm_cvtss_f32(sum)
 }
 
 #[cfg(target_os = "linux")]

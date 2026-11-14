@@ -11,3 +11,4 @@ out/
 *.gguf
 .env
 *.ptx
+!kernels/gemv.ptx

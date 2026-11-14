@@ -131,6 +131,29 @@ impl<'a> MetadataValue<'a> {
         }
         Some(result)
     }
+
+    pub fn array_u32(&self) -> Option<Vec<u32>> {
+        let (type_code, raw) = match self {
+            Self::Raw { type_code, bytes } => (*type_code, *bytes),
+        };
+        if type_code != 9 || raw.len() < 12 {
+            return None;
+        }
+        let element_type = u32::from_le_bytes(raw[..4].try_into().ok()?);
+        if element_type != 4 && element_type != 5 {
+            return None;
+        }
+        let count = usize::try_from(u64::from_le_bytes(raw[4..12].try_into().ok()?)).ok()?;
+        let values = raw.get(12..12 + count.checked_mul(4)?)?;
+        Some(
+            values
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| u32::from_le_bytes(*bytes))
+                .collect(),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -1,0 +1,4296 @@
+.version 7.0
+.target sm_80
+.address_size 64
+
+.const .align 4 .u32 q1_sign_lut[16] = {
+    0xffffffff, 0xffffff01, 0xffff01ff, 0xffff0101,
+    0xff01ffff, 0xff01ff01, 0xff0101ff, 0xff010101,
+    0x01ffffff, 0x01ffff01, 0x01ff01ff, 0x01ff0101,
+    0x0101ffff, 0x0101ff01, 0x010101ff, 0x01010101
+};
+
+.visible .entry gemv_q8_0(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p<3>;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t3, %q_s32;
+    .reg .b64 %w_ptr, %in_ptr, %out_ptr, %row_offset, %block_offset, %lane_offset, %row_64;
+    .reg .f32 %scale, %q_f, %act, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %w_ptr, [weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5;
+
+    mul.wide.u32 %row_offset, %num_blocks, 34;
+    cvt.u64.u32 %row_64, %row;
+    mul.lo.u64 %row_offset, %row_offset, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_offset;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop:
+    setp.ge.u32 %p1, %b, %num_blocks;
+    @%p1 bra $L_reduce;
+
+    mul.wide.u32 %block_offset, %b, 34;
+    add.u64 %block_offset, %w_ptr, %block_offset;
+
+    ld.global.cs.u16 %h0, [%block_offset];
+    cvt.f32.f16 %scale, %h0;
+
+    cvt.u64.u32 %lane_offset, %lane;
+    add.u64 %lane_offset, %lane_offset, 2;
+    add.u64 %lane_offset, %block_offset, %lane_offset;
+    ld.global.cs.s8 %q_s32, [%lane_offset];
+    cvt.rn.f32.s32 %q_f, %q_s32;
+
+    shl.b32 %t3, %b, 5;
+    add.u32 %t3, %t3, %lane;
+    mul.wide.u32 %lane_offset, %t3, 4;
+    add.u64 %lane_offset, %in_ptr, %lane_offset;
+    ld.global.f32 %act, [%lane_offset];
+
+    mul.f32 %q_f, %q_f, %scale;
+    fma.rn.f32 %sum, %q_f, %act, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop;
+
+$L_reduce:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @%p2 mul.wide.u32 %lane_offset, %row, 4;
+    @%p2 add.u64 %lane_offset, %out_ptr, %lane_offset;
+    @%p2 st.global.f32 [%lane_offset], %sum;
+
+    ret;
+}
+
+.visible .entry gemv_fused_qkv_q8_0(
+    .param .u64 q_weights_ptr,
+    .param .u64 k_weights_ptr,
+    .param .u64 v_weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_qkv_ptr,
+    .param .u32 cols,
+    .param .u32 q_rows,
+    .param .u32 k_rows,
+    .param .u32 v_rows
+)
+{
+    .reg .pred %p_valid, %p_is_q, %p_is_k, %p1, %p2;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %warp_id, %global_row, %cols, %q_rows, %k_rows, %v_rows, %total_rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t3, %q_s32, %local_row, %k_limit;
+    .reg .b64 %q_ptr, %k_ptr, %v_ptr, %w_ptr, %in_ptr, %out_ptr, %row_offset, %block_offset, %lane_offset, %row_64;
+    .reg .f32 %scale, %q_f, %act, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %global_row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %q_rows, [q_rows];
+    ld.param.u32 %k_rows, [k_rows];
+    ld.param.u32 %v_rows, [v_rows];
+
+    add.u32 %k_limit, %q_rows, %k_rows;
+    add.u32 %total_rows, %k_limit, %v_rows;
+
+    setp.lt.u32 %p_valid, %global_row, %total_rows;
+    @!%p_valid ret;
+
+    ld.param.u64 %q_ptr, [q_weights_ptr];
+    ld.param.u64 %k_ptr, [k_weights_ptr];
+    ld.param.u64 %v_ptr, [v_weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_qkv_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5;
+    mul.wide.u32 %row_offset, %num_blocks, 34;
+
+    setp.lt.u32 %p_is_q, %global_row, %q_rows;
+    @%p_is_q mov.u64 %w_ptr, %q_ptr;
+    @%p_is_q mov.u32 %local_row, %global_row;
+    @%p_is_q bra $L_got_row;
+
+    setp.lt.u32 %p_is_k, %global_row, %k_limit;
+    @%p_is_k mov.u64 %w_ptr, %k_ptr;
+    @%p_is_k sub.u32 %local_row, %global_row, %q_rows;
+    @%p_is_k bra $L_got_row;
+
+    mov.u64 %w_ptr, %v_ptr;
+    sub.u32 %local_row, %global_row, %k_limit;
+
+$L_got_row:
+    cvt.u64.u32 %row_64, %local_row;
+    mul.lo.u64 %row_offset, %row_offset, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_offset;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_qkv:
+    setp.ge.u32 %p1, %b, %num_blocks;
+    @%p1 bra $L_reduce_qkv;
+
+    mul.wide.u32 %block_offset, %b, 34;
+    add.u64 %block_offset, %w_ptr, %block_offset;
+
+    ld.global.cs.u16 %h0, [%block_offset];
+    cvt.f32.f16 %scale, %h0;
+
+    cvt.u64.u32 %lane_offset, %lane;
+    add.u64 %lane_offset, %lane_offset, 2;
+    add.u64 %lane_offset, %block_offset, %lane_offset;
+    ld.global.cs.s8 %q_s32, [%lane_offset];
+    cvt.rn.f32.s32 %q_f, %q_s32;
+
+    shl.b32 %t3, %b, 5;
+    add.u32 %t3, %t3, %lane;
+    mul.wide.u32 %lane_offset, %t3, 4;
+    add.u64 %lane_offset, %in_ptr, %lane_offset;
+    ld.global.f32 %act, [%lane_offset];
+
+    mul.f32 %q_f, %q_f, %scale;
+    fma.rn.f32 %sum, %q_f, %act, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_qkv;
+
+$L_reduce_qkv:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @%p2 mul.wide.u32 %lane_offset, %global_row, 4;
+    @%p2 add.u64 %lane_offset, %out_ptr, %lane_offset;
+    @%p2 st.global.f32 [%lane_offset], %sum;
+
+    ret;
+}
+
+.visible .entry gemv_fused_ffn_q8_0(
+    .param .u64 gate_ptr,
+    .param .u64 up_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p<3>;
+    .reg .b16 %h_g, %h_u;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t3, %q_g_s32, %q_u_s32;
+    .reg .b64 %g_ptr, %u_ptr, %in_ptr, %out_ptr, %row_offset, %block_offset, %lane_offset, %row_64;
+    .reg .f32 %scale_g, %scale_u, %q_g_f, %q_u_f, %act, %sum_g, %sum_u, %shfl_tmp;
+    .reg .f32 %neg_g, %log2_e, %exp_neg_g, %denom, %sig, %silu, %fused;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %g_ptr, [gate_ptr];
+    ld.param.u64 %u_ptr, [up_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5;
+
+    mul.wide.u32 %row_offset, %num_blocks, 34;
+    cvt.u64.u32 %row_64, %row;
+    mul.lo.u64 %row_offset, %row_offset, %row_64;
+    add.u64 %g_ptr, %g_ptr, %row_offset;
+    add.u64 %u_ptr, %u_ptr, %row_offset;
+
+    mov.f32 %sum_g, 0.0;
+    mov.f32 %sum_u, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_ffn:
+    setp.ge.u32 %p1, %b, %num_blocks;
+    @%p1 bra $L_reduce_ffn;
+
+    mul.wide.u32 %block_offset, %b, 34;
+
+    add.u64 %row_offset, %g_ptr, %block_offset;
+    ld.global.cs.u16 %h_g, [%row_offset];
+    cvt.f32.f16 %scale_g, %h_g;
+
+    add.u64 %row_offset, %u_ptr, %block_offset;
+    ld.global.cs.u16 %h_u, [%row_offset];
+    cvt.f32.f16 %scale_u, %h_u;
+
+    cvt.u64.u32 %lane_offset, %lane;
+    add.u64 %lane_offset, %lane_offset, 2;
+
+    add.u64 %row_offset, %g_ptr, %block_offset;
+    add.u64 %row_offset, %row_offset, %lane_offset;
+    ld.global.cs.s8 %q_g_s32, [%row_offset];
+    cvt.rn.f32.s32 %q_g_f, %q_g_s32;
+
+    add.u64 %row_offset, %u_ptr, %block_offset;
+    add.u64 %row_offset, %row_offset, %lane_offset;
+    ld.global.cs.s8 %q_u_s32, [%row_offset];
+    cvt.rn.f32.s32 %q_u_f, %q_u_s32;
+
+    shl.b32 %t3, %b, 5;
+    add.u32 %t3, %t3, %lane;
+    mul.wide.u32 %lane_offset, %t3, 4;
+    add.u64 %lane_offset, %in_ptr, %lane_offset;
+    ld.global.f32 %act, [%lane_offset];
+
+    mul.f32 %q_g_f, %q_g_f, %scale_g;
+    fma.rn.f32 %sum_g, %q_g_f, %act, %sum_g;
+
+    mul.f32 %q_u_f, %q_u_f, %scale_u;
+    fma.rn.f32 %sum_u, %q_u_f, %act, %sum_u;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_ffn;
+
+$L_reduce_ffn:
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 16, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 8, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 4, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 2, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 1, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 16, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 8, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 4, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 2, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 1, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @!%p2 ret;
+
+    neg.f32 %neg_g, %sum_g;
+    mul.f32 %log2_e, %neg_g, 0f3fb8aa3b;
+    ex2.approx.f32 %exp_neg_g, %log2_e;
+    add.f32 %denom, %exp_neg_g, 0f3f800000;
+    rcp.approx.f32 %sig, %denom;
+    mul.f32 %silu, %sum_g, %sig;
+    mul.f32 %fused, %silu, %sum_u;
+
+    mul.wide.u32 %lane_offset, %row, 4;
+    add.u64 %lane_offset, %out_ptr, %lane_offset;
+    st.global.f32 [%lane_offset], %fused;
+
+    ret;
+}
+
+// Branch-Free 16-Thread Dual-Row Q4_0 GEMV (Zero Warp Divergence)
+.visible .entry gemv_q4_0(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_valid, %p_loop, %p_lane0;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %lane16, %sub_row, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t2, %byte_val, %nib_lo, %nib_hi, %act_idx_lo, %act_idx_hi;
+    .reg .b64 %w_ptr, %in_ptr, %out_ptr, %row_stride, %block_stride, %block_addr, %lane_addr, %act_addr, %row_64;
+    .reg .f32 %scale, %q_lo, %q_hi, %act_lo, %act_hi, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    and.b32 %lane16, %lane, 15;
+    shr.u32 %sub_row, %lane, 4;
+
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %t2, %t0, %t1, %warp_id;
+    shl.b32 %t2, %t2, 1;
+    add.u32 %row, %t2, %sub_row;
+
+    ld.param.u32 %rows, [rows];
+    setp.lt.u32 %p_valid, %row, %rows;
+    @!%p_valid ret;
+
+    ld.param.u64 %w_ptr, [weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5;
+    mul.wide.u32 %row_stride, %num_blocks, 18;
+
+    cvt.u64.u32 %row_64, %row;
+    mul.lo.u64 %row_stride, %row_stride, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_stride;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_fast_q4:
+    setp.ge.u32 %p_loop, %b, %num_blocks;
+    @%p_loop bra $L_reduce_fast_q4;
+
+    mul.wide.u32 %block_stride, %b, 18;
+    add.u64 %block_addr, %w_ptr, %block_stride;
+
+    ld.global.u16 %h0, [%block_addr];
+    cvt.f32.f16 %scale, %h0;
+
+    cvt.u64.u32 %lane_addr, %lane16;
+    add.u64 %lane_addr, %lane_addr, 2;
+    add.u64 %lane_addr, %block_addr, %lane_addr;
+    ld.global.u8 %byte_val, [%lane_addr];
+
+    and.b32 %nib_lo, %byte_val, 15;
+    sub.s32 %nib_lo, %nib_lo, 8;
+    cvt.rn.f32.s32 %q_lo, %nib_lo;
+
+    shr.u32 %nib_hi, %byte_val, 4;
+    and.b32 %nib_hi, %nib_hi, 15;
+    sub.s32 %nib_hi, %nib_hi, 8;
+    cvt.rn.f32.s32 %q_hi, %nib_hi;
+
+    mul.f32 %q_lo, %q_lo, %scale;
+    mul.f32 %q_hi, %q_hi, %scale;
+
+    shl.b32 %act_idx_lo, %b, 5;
+    add.u32 %act_idx_lo, %act_idx_lo, %lane16;
+    add.u32 %act_idx_hi, %act_idx_lo, 16;
+
+    mul.wide.u32 %act_addr, %act_idx_lo, 4;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    ld.global.f32 %act_lo, [%act_addr];
+
+    mul.wide.u32 %act_addr, %act_idx_hi, 4;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    ld.global.f32 %act_hi, [%act_addr];
+
+    fma.rn.f32 %sum, %q_lo, %act_lo, %sum;
+    fma.rn.f32 %sum, %q_hi, %act_hi, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_fast_q4;
+
+$L_reduce_fast_q4:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p_lane0, %lane16, 0;
+    @!%p_lane0 ret;
+
+    mul.wide.u32 %act_addr, %row, 4;
+    add.u64 %act_addr, %out_ptr, %act_addr;
+    st.global.f32 [%act_addr], %sum;
+
+    ret;
+}
+
+// Branch-Free 16-Thread Dual-Row Q4_0 Fused QKV
+.visible .entry gemv_fused_qkv_q4_0(
+    .param .u64 q_weights_ptr,
+    .param .u64 k_weights_ptr,
+    .param .u64 v_weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_qkv_ptr,
+    .param .u32 cols,
+    .param .u32 q_rows,
+    .param .u32 k_rows,
+    .param .u32 v_rows
+)
+{
+    .reg .pred %p_valid, %p_loop, %p_lane0, %p_is_q, %p_is_k;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %lane16, %sub_row, %warp_id, %global_row, %local_row, %cols, %q_rows, %k_rows, %v_rows, %total_rows, %k_limit, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t2, %byte_val, %nib_lo, %nib_hi, %act_idx_lo, %act_idx_hi;
+    .reg .b64 %q_ptr, %k_ptr, %v_ptr, %w_ptr, %in_ptr, %out_ptr, %row_stride, %block_stride, %block_addr, %lane_addr, %act_addr, %row_64;
+    .reg .f32 %scale, %q_lo, %q_hi, %act_lo, %act_hi, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    and.b32 %lane16, %lane, 15;
+    shr.u32 %sub_row, %lane, 4;
+
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %t2, %t0, %t1, %warp_id;
+    shl.b32 %t2, %t2, 1;
+    add.u32 %global_row, %t2, %sub_row;
+
+    ld.param.u32 %q_rows, [q_rows];
+    ld.param.u32 %k_rows, [k_rows];
+    ld.param.u32 %v_rows, [v_rows];
+
+    add.u32 %k_limit, %q_rows, %k_rows;
+    add.u32 %total_rows, %k_limit, %v_rows;
+
+    setp.lt.u32 %p_valid, %global_row, %total_rows;
+    @!%p_valid ret;
+
+    ld.param.u64 %q_ptr, [q_weights_ptr];
+    ld.param.u64 %k_ptr, [k_weights_ptr];
+    ld.param.u64 %v_ptr, [v_weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_qkv_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5;
+    mul.wide.u32 %row_stride, %num_blocks, 18;
+
+    setp.lt.u32 %p_is_q, %global_row, %q_rows;
+    @%p_is_q mov.u64 %w_ptr, %q_ptr;
+    @%p_is_q mov.u32 %local_row, %global_row;
+    @%p_is_q bra $L_got_row_q4;
+
+    setp.lt.u32 %p_is_k, %global_row, %k_limit;
+    @%p_is_k mov.u64 %w_ptr, %k_ptr;
+    @%p_is_k sub.u32 %local_row, %global_row, %q_rows;
+    @%p_is_k bra $L_got_row_q4;
+
+    mov.u64 %w_ptr, %v_ptr;
+    sub.u32 %local_row, %global_row, %k_limit;
+
+$L_got_row_q4:
+    cvt.u64.u32 %row_64, %local_row;
+    mul.lo.u64 %row_stride, %row_stride, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_stride;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_qkv_q4:
+    setp.ge.u32 %p_loop, %b, %num_blocks;
+    @%p_loop bra $L_reduce_qkv_q4;
+
+    mul.wide.u32 %block_stride, %b, 18;
+    add.u64 %block_addr, %w_ptr, %block_stride;
+
+    ld.global.u16 %h0, [%block_addr];
+    cvt.f32.f16 %scale, %h0;
+
+    cvt.u64.u32 %lane_addr, %lane16;
+    add.u64 %lane_addr, %lane_addr, 2;
+    add.u64 %lane_addr, %block_addr, %lane_addr;
+    ld.global.u8 %byte_val, [%lane_addr];
+
+    and.b32 %nib_lo, %byte_val, 15;
+    sub.s32 %nib_lo, %nib_lo, 8;
+    cvt.rn.f32.s32 %q_lo, %nib_lo;
+
+    shr.u32 %nib_hi, %byte_val, 4;
+    and.b32 %nib_hi, %nib_hi, 15;
+    sub.s32 %nib_hi, %nib_hi, 8;
+    cvt.rn.f32.s32 %q_hi, %nib_hi;
+
+    mul.f32 %q_lo, %q_lo, %scale;
+    mul.f32 %q_hi, %q_hi, %scale;
+
+    shl.b32 %act_idx_lo, %b, 5;
+    add.u32 %act_idx_lo, %act_idx_lo, %lane16;
+    add.u32 %act_idx_hi, %act_idx_lo, 16;
+
+    mul.wide.u32 %act_addr, %act_idx_lo, 4;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    ld.global.f32 %act_lo, [%act_addr];
+
+    mul.wide.u32 %act_addr, %act_idx_hi, 4;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    ld.global.f32 %act_hi, [%act_addr];
+
+    fma.rn.f32 %sum, %q_lo, %act_lo, %sum;
+    fma.rn.f32 %sum, %q_hi, %act_hi, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_qkv_q4;
+
+$L_reduce_qkv_q4:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p_lane0, %lane16, 0;
+    @!%p_lane0 ret;
+
+    mul.wide.u32 %act_addr, %global_row, 4;
+    add.u64 %act_addr, %out_ptr, %act_addr;
+    st.global.f32 [%act_addr], %sum;
+
+    ret;
+}
+
+// Branch-Free 16-Thread Dual-Row Q4_0 Fused FFN (Zero Warp Divergence)
+.visible .entry gemv_fused_ffn_q4_0(
+    .param .u64 gate_ptr,
+    .param .u64 up_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_valid, %p_loop, %p_lane0;
+    .reg .b16 %h_g, %h_u;
+    .reg .b32 %lane, %lane16, %sub_row, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t2, %bg, %bu, %nlo_g, %nhi_g, %nlo_u, %nhi_u, %act_idx_lo, %act_idx_hi;
+    .reg .b64 %g_ptr, %u_ptr, %in_ptr, %out_ptr, %row_stride, %block_stride, %block_g, %block_u, %lane_g, %lane_u, %act_addr, %row_64;
+    .reg .f32 %scale_g, %scale_u, %qlo_g, %qhi_g, %qlo_u, %qhi_u, %act_lo, %act_hi, %sum_g, %sum_u, %shfl_tmp;
+    .reg .f32 %neg_g, %log2_e, %exp_neg_g, %denom, %sig, %silu, %fused;
+
+    mov.u32 %lane, %tid.x;
+    and.b32 %lane16, %lane, 15;
+    shr.u32 %sub_row, %lane, 4;
+
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %t2, %t0, %t1, %warp_id;
+    shl.b32 %t2, %t2, 1;
+    add.u32 %row, %t2, %sub_row;
+
+    ld.param.u32 %rows, [rows];
+    setp.lt.u32 %p_valid, %row, %rows;
+    @!%p_valid ret;
+
+    ld.param.u64 %g_ptr, [gate_ptr];
+    ld.param.u64 %u_ptr, [up_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5;
+    mul.wide.u32 %row_stride, %num_blocks, 18;
+
+    cvt.u64.u32 %row_64, %row;
+    mul.lo.u64 %row_stride, %row_stride, %row_64;
+    add.u64 %g_ptr, %g_ptr, %row_stride;
+    add.u64 %u_ptr, %u_ptr, %row_stride;
+
+    mov.f32 %sum_g, 0.0;
+    mov.f32 %sum_u, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_ffn_fast:
+    setp.ge.u32 %p_loop, %b, %num_blocks;
+    @%p_loop bra $L_reduce_ffn_fast;
+
+    mul.wide.u32 %block_stride, %b, 18;
+    add.u64 %block_g, %g_ptr, %block_stride;
+    add.u64 %block_u, %u_ptr, %block_stride;
+
+    ld.global.u16 %h_g, [%block_g];
+    cvt.f32.f16 %scale_g, %h_g;
+
+    ld.global.u16 %h_u, [%block_u];
+    cvt.f32.f16 %scale_u, %h_u;
+
+    cvt.u64.u32 %lane_g, %lane16;
+    add.u64 %lane_g, %lane_g, 2;
+    add.u64 %lane_u, %block_u, %lane_g;
+    add.u64 %lane_g, %block_g, %lane_g;
+
+    ld.global.u8 %bg, [%lane_g];
+    ld.global.u8 %bu, [%lane_u];
+
+    // Gate nibbles
+    and.b32 %nlo_g, %bg, 15;
+    sub.s32 %nlo_g, %nlo_g, 8;
+    cvt.rn.f32.s32 %qlo_g, %nlo_g;
+
+    shr.u32 %nhi_g, %bg, 4;
+    and.b32 %nhi_g, %nhi_g, 15;
+    sub.s32 %nhi_g, %nhi_g, 8;
+    cvt.rn.f32.s32 %qhi_g, %nhi_g;
+
+    mul.f32 %qlo_g, %qlo_g, %scale_g;
+    mul.f32 %qhi_g, %qhi_g, %scale_g;
+
+    // Up nibbles
+    and.b32 %nlo_u, %bu, 15;
+    sub.s32 %nlo_u, %nlo_u, 8;
+    cvt.rn.f32.s32 %qlo_u, %nlo_u;
+
+    shr.u32 %nhi_u, %bu, 4;
+    and.b32 %nhi_u, %nhi_u, 15;
+    sub.s32 %nhi_u, %nhi_u, 8;
+    cvt.rn.f32.s32 %qhi_u, %nhi_u;
+
+    mul.f32 %qlo_u, %qlo_u, %scale_u;
+    mul.f32 %qhi_u, %qhi_u, %scale_u;
+
+    // Load activations
+    shl.b32 %act_idx_lo, %b, 5;
+    add.u32 %act_idx_lo, %act_idx_lo, %lane16;
+    add.u32 %act_idx_hi, %act_idx_lo, 16;
+
+    mul.wide.u32 %act_addr, %act_idx_lo, 4;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    ld.global.f32 %act_lo, [%act_addr];
+
+    mul.wide.u32 %act_addr, %act_idx_hi, 4;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    ld.global.f32 %act_hi, [%act_addr];
+
+    fma.rn.f32 %sum_g, %qlo_g, %act_lo, %sum_g;
+    fma.rn.f32 %sum_g, %qhi_g, %act_hi, %sum_g;
+
+    fma.rn.f32 %sum_u, %qlo_u, %act_lo, %sum_u;
+    fma.rn.f32 %sum_u, %qhi_u, %act_hi, %sum_u;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_ffn_fast;
+
+$L_reduce_ffn_fast:
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 8, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 4, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 2, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 1, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 8, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 4, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 2, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 1, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+
+    setp.eq.u32 %p_lane0, %lane16, 0;
+    @!%p_lane0 ret;
+
+    neg.f32 %neg_g, %sum_g;
+    mul.f32 %log2_e, %neg_g, 0f3fb8aa3b;
+    ex2.approx.f32 %exp_neg_g, %log2_e;
+    add.f32 %denom, %exp_neg_g, 0f3f800000;
+    rcp.approx.f32 %sig, %denom;
+    mul.f32 %silu, %sum_g, %sig;
+    mul.f32 %fused, %silu, %sum_u;
+
+    mul.wide.u32 %act_addr, %row, 4;
+    add.u64 %act_addr, %out_ptr, %act_addr;
+    st.global.f32 [%act_addr], %fused;
+
+    ret;
+}
+
+.visible .entry argmax_f32(
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols
+)
+{
+    .reg .pred %p0, %p1, %p2, %p_dummy;
+    .reg .b32 %lane, %cols, %idx, %cur_idx, %shfl_idx, %max_b, %shfl_b;
+    .reg .b64 %in_ptr, %out_ptr, %offset;
+    .reg .f32 %max_val, %cur_val, %shfl_val;
+
+    mov.u32 %lane, %tid.x;
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    mov.f32 %max_val, 0fc9742400; // -1,000,000.0f
+    mov.u32 %cur_idx, 0;
+    mov.u32 %idx, %lane;
+
+$L_stride_loop_argmax:
+    setp.ge.u32 %p0, %idx, %cols;
+    @%p0 bra $L_shfl_reduce_argmax;
+
+    mul.wide.u32 %offset, %idx, 4;
+    add.u64 %offset, %in_ptr, %offset;
+    ld.global.f32 %cur_val, [%offset];
+
+    setp.gt.f32 %p1, %cur_val, %max_val;
+    @%p1 mov.f32 %max_val, %cur_val;
+    @%p1 mov.u32 %cur_idx, %idx;
+
+    add.u32 %idx, %idx, 32;
+    bra $L_stride_loop_argmax;
+
+$L_shfl_reduce_argmax:
+    // Step 16
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 16, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 16, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    // Step 8
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 8, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 8, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    // Step 4
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 4, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 4, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    // Step 2
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 2, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 2, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    // Step 1
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 1, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 1, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @%p2 st.global.u32 [%out_ptr], %cur_idx;
+
+    ret;
+}
+
+.visible .entry top64_sample(
+    .param .u64 input_ptr,
+    .param .u64 out_tokens_ptr,
+    .param .u64 out_logits_ptr,
+    .param .u32 cols,
+    .param .f32 inv_temp
+)
+{
+    .reg .pred %p0, %p1, %p2, %p_dummy;
+    .reg .b32 %lane, %block_id, %cols, %idx, %stride, %cur_idx, %shfl_idx, %max_b, %shfl_b;
+    .reg .b64 %in_ptr, %out_t_ptr, %out_l_ptr, %offset, %out_off;
+    .reg .f32 %inv_temp, %max_val, %cur_val, %shfl_val;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %block_id, %ctaid.x;
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_t_ptr, [out_tokens_ptr];
+    ld.param.u64 %out_l_ptr, [out_logits_ptr];
+    ld.param.u32 %cols, [cols];
+    ld.param.f32 %inv_temp, [inv_temp];
+
+    mov.f32 %max_val, 0fc9742400; // -1,000,000.0f
+    mov.u32 %cur_idx, 0;
+
+    mad.lo.u32 %idx, %block_id, 32, %lane;
+    mov.u32 %stride, 2048; // 64 blocks * 32 threads
+
+$L_stride_loop_topk:
+    setp.ge.u32 %p0, %idx, %cols;
+    @%p0 bra $L_shfl_reduce_topk;
+
+    mul.wide.u32 %offset, %idx, 4;
+    add.u64 %offset, %in_ptr, %offset;
+    ld.global.f32 %cur_val, [%offset];
+
+    setp.gt.f32 %p1, %cur_val, %max_val;
+    @%p1 mov.f32 %max_val, %cur_val;
+    @%p1 mov.u32 %cur_idx, %idx;
+
+    add.u32 %idx, %idx, %stride;
+    bra $L_stride_loop_topk;
+
+$L_shfl_reduce_topk:
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 16, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 16, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 8, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 8, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 4, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 4, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 2, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 2, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    mov.b32 %max_b, %max_val;
+    shfl.sync.down.b32 %shfl_b|%p_dummy, %max_b, 1, 31, 0xffffffff;
+    mov.b32 %shfl_val, %shfl_b;
+    shfl.sync.down.b32 %shfl_idx|%p_dummy, %cur_idx, 1, 31, 0xffffffff;
+    setp.gt.f32 %p1, %shfl_val, %max_val;
+    @%p1 mov.f32 %max_val, %shfl_val;
+    @%p1 mov.u32 %cur_idx, %shfl_idx;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @!%p2 ret;
+
+    mul.f32 %max_val, %max_val, %inv_temp;
+
+    mul.wide.u32 %out_off, %block_id, 4;
+    add.u64 %offset, %out_t_ptr, %out_off;
+    st.global.u32 [%offset], %cur_idx;
+
+    add.u64 %offset, %out_l_ptr, %out_off;
+    st.global.f32 [%offset], %max_val;
+
+    ret;
+}
+
+// Q1_0 x compact-Q8 GEMV. Q1_0 blocks hold 128 bipolar signs and one FP16
+// scale in 18 bytes. The activation group is [4 x f16 scale][128 x i8] (136
+// bytes). Each lane evaluates four products with dp4a.
+.visible .entry gemv_q1_0(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p<6>;
+    .reg .b16 %h_w, %h_x;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %byte_idx, %nibble_shift, %q8_block, %q8_idx;
+    .reg .b32 %raw, %bits, %s0, %s1, %s2, %s3, %sign32, %q32, %dot;
+    .reg .b64 %w_ptr, %x_ptr, %out_ptr, %row_stride, %row64, %row_off;
+    .reg .b64 %block_off, %addr, %lane_off;
+    .reg .f32 %dw, %dx, %scale, %dotf, %sum, %shfl;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %w_ptr, [weights_ptr];
+    ld.param.u64 %x_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    shr.u32 %num_blocks, %cols, 7;
+    mul.wide.u32 %row_stride, %num_blocks, 18;
+    cvt.u64.u32 %row64, %row;
+    mul.lo.u64 %row_off, %row_stride, %row64;
+    add.u64 %w_ptr, %w_ptr, %row_off;
+
+    shr.u32 %byte_idx, %lane, 1;
+    and.b32 %nibble_shift, %lane, 1;
+    shl.b32 %nibble_shift, %nibble_shift, 2;
+    shr.u32 %q8_block, %lane, 3;
+    and.b32 %q8_idx, %lane, 7;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+$L_q1_loop:
+    setp.ge.u32 %p1, %b, %num_blocks;
+    @%p1 bra $L_q1_reduce;
+
+    mul.wide.u32 %block_off, %b, 18;
+    add.u64 %block_off, %w_ptr, %block_off;
+    ld.global.cs.u16 %h_w, [%block_off];
+    cvt.f32.f16 %dw, %h_w;
+    cvt.u64.u32 %lane_off, %byte_idx;
+    add.u64 %addr, %block_off, %lane_off;
+    add.u64 %addr, %addr, 2;
+    ld.global.cs.u8 %raw, [%addr];
+    shr.u32 %bits, %raw, %nibble_shift;
+
+    and.b32 %s0, %bits, 1;
+    shl.b32 %s0, %s0, 1;
+    sub.s32 %s0, %s0, 1;
+    shr.u32 %s1, %bits, 1;
+    and.b32 %s1, %s1, 1;
+    shl.b32 %s1, %s1, 1;
+    sub.s32 %s1, %s1, 1;
+    shr.u32 %s2, %bits, 2;
+    and.b32 %s2, %s2, 1;
+    shl.b32 %s2, %s2, 1;
+    sub.s32 %s2, %s2, 1;
+    shr.u32 %s3, %bits, 3;
+    and.b32 %s3, %s3, 1;
+    shl.b32 %s3, %s3, 1;
+    sub.s32 %s3, %s3, 1;
+    and.b32 %sign32, %s0, 255;
+    and.b32 %s1, %s1, 255;
+    shl.b32 %s1, %s1, 8;
+    or.b32 %sign32, %sign32, %s1;
+    and.b32 %s2, %s2, 255;
+    shl.b32 %s2, %s2, 16;
+    or.b32 %sign32, %sign32, %s2;
+    and.b32 %s3, %s3, 255;
+    shl.b32 %s3, %s3, 24;
+    or.b32 %sign32, %sign32, %s3;
+
+    mul.wide.u32 %block_off, %b, 136;
+    add.u64 %block_off, %x_ptr, %block_off;
+    shl.b32 %t0, %q8_block, 1;
+    cvt.u64.u32 %lane_off, %t0;
+    add.u64 %addr, %block_off, %lane_off;
+    ld.global.u16 %h_x, [%addr];
+    cvt.f32.f16 %dx, %h_x;
+    shl.b32 %t0, %q8_block, 5;
+    shl.b32 %t1, %q8_idx, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %lane_off, %t0;
+    add.u64 %addr, %block_off, %lane_off;
+    ld.global.u32 %q32, [%addr];
+    dp4a.s32.s32 %dot, %sign32, %q32, 0;
+    cvt.rn.f32.s32 %dotf, %dot;
+    mul.f32 %scale, %dw, %dx;
+    fma.rn.f32 %sum, %dotf, %scale, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_q1_loop;
+
+$L_q1_reduce:
+    shfl.sync.down.b32 %shfl, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl;
+    shfl.sync.down.b32 %shfl, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl;
+    shfl.sync.down.b32 %shfl, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl;
+    shfl.sync.down.b32 %shfl, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl;
+    shfl.sync.down.b32 %shfl, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl;
+    setp.eq.u32 %p2, %lane, 0;
+    @!%p2 ret;
+    mul.wide.u32 %row_off, %row, 4;
+    add.u64 %row_off, %out_ptr, %row_off;
+    st.global.f32 [%row_off], %sum;
+    ret;
+}
+
+// Q1_0 v2: two output rows per warp share the compact Q8 activation loads.
+.visible .entry gemv_q1_0_v2(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_bad, %p_row1, %p_done, %p_lane0, %p_initwarp, %p_initlane, %p_init;
+    .reg .b16 %hw0, %hw1, %hx;
+    .reg .b32 %lane, %warp, %row0, %row1, %cols, %rows, %nb, %b;
+    .reg .b32 %t0, %t1, %byte_idx, %shift, %xb, %xi;
+    .reg .b32 %raw0, %raw1, %bits0, %bits1, %a0, %a1, %a2, %a3;
+    .reg .b32 %sign0, %sign1, %q32, %dot0, %dot1;
+    .reg .b64 %weights, %input, %output, %stride, %row64, %roff;
+    .reg .b64 %wp0, %wp1, %boff, %addr, %off, %outaddr, %lutbase, %lutaddr, %constbase;
+    .reg .b64 %wscale0, %wscale1, %wsign0, %wsign1, %xgroup;
+    .reg .f32 %dw0, %dw1, %dx, %sc0, %sc1, %df0, %df1;
+    .reg .f32 %sum0, %sum1, %sh0, %sh1;
+    .shared .align 4 .b8 q12_sign_lut[64];
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp, %tid.y;
+    mov.u64 %lutbase, q12_sign_lut;
+    setp.eq.u32 %p_initwarp, %warp, 0;
+    setp.lt.u32 %p_initlane, %lane, 16;
+    and.pred %p_init, %p_initwarp, %p_initlane;
+    @%p_init mov.u64 %constbase, q1_sign_lut;
+    @%p_init shl.b32 %t0, %lane, 2;
+    @%p_init cvt.u64.u32 %lutaddr, %t0;
+    @%p_init add.u64 %addr, %constbase, %lutaddr;
+    @%p_init ld.const.u32 %sign0, [%addr];
+    @%p_init add.u64 %lutaddr, %lutbase, %lutaddr;
+    @%p_init st.shared.u32 [%lutaddr], %sign0;
+    bar.sync 0;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row0, %t0, %t1, %warp;
+    shl.b32 %row0, %row0, 1;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_bad, %row0, %rows;
+    @%p_bad ret;
+    add.u32 %row1, %row0, 1;
+    setp.lt.u32 %p_row1, %row1, %rows;
+
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    shr.u32 %nb, %cols, 7;
+    mul.wide.u32 %stride, %nb, 18;
+    cvt.u64.u32 %row64, %row0;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wp0, %weights, %roff;
+    cvt.u64.u32 %row64, %row1;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wp1, %weights, %roff;
+
+    shr.u32 %byte_idx, %lane, 1;
+    and.b32 %shift, %lane, 1;
+    shl.b32 %shift, %shift, 2;
+    shr.u32 %xb, %lane, 3;
+    and.b32 %xi, %lane, 7;
+    mov.u64 %wscale0, %wp0;
+    mov.u64 %wscale1, %wp1;
+    cvt.u64.u32 %off, %byte_idx;
+    add.u64 %wsign0, %wp0, %off;
+    add.u64 %wsign0, %wsign0, 2;
+    add.u64 %wsign1, %wp1, %off;
+    add.u64 %wsign1, %wsign1, 2;
+    mov.u64 %xgroup, %input;
+    mov.f32 %sum0, 0.0;
+    mov.f32 %sum1, 0.0;
+    mov.u16 %hw1, 0;
+    mov.u32 %raw1, 0;
+    mov.u32 %b, 0;
+
+$L_q12_loop:
+    setp.ge.u32 %p_done, %b, %nb;
+    @%p_done bra $L_q12_reduce;
+    ld.global.cs.u16 %hw0, [%wscale0];
+    cvt.f32.f16 %dw0, %hw0;
+    ld.global.cs.u8 %raw0, [%wsign0];
+
+    @%p_row1 ld.global.cs.u16 %hw1, [%wscale1];
+    cvt.f32.f16 %dw1, %hw1;
+    @%p_row1 ld.global.cs.u8 %raw1, [%wsign1];
+
+    // Decode four bipolar signs through a shared-memory LUT.
+    shr.u32 %bits0, %raw0, %shift;
+    and.b32 %bits0, %bits0, 15;
+    shl.b32 %t0, %bits0, 2;
+    cvt.u64.u32 %lutaddr, %t0;
+    add.u64 %lutaddr, %lutbase, %lutaddr;
+    ld.shared.u32 %sign0, [%lutaddr];
+    shr.u32 %bits1, %raw1, %shift;
+    and.b32 %bits1, %bits1, 15;
+    shl.b32 %t0, %bits1, 2;
+    cvt.u64.u32 %lutaddr, %t0;
+    add.u64 %lutaddr, %lutbase, %lutaddr;
+    ld.shared.u32 %sign1, [%lutaddr];
+
+    shl.b32 %t0, %xb, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xgroup, %off;
+    ld.global.u16 %hx, [%addr];
+    cvt.f32.f16 %dx, %hx;
+    shl.b32 %t0, %xb, 5;
+    shl.b32 %t1, %xi, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xgroup, %off;
+    ld.global.u32 %q32, [%addr];
+    dp4a.s32.s32 %dot0, %sign0, %q32, 0;
+    dp4a.s32.s32 %dot1, %sign1, %q32, 0;
+    cvt.rn.f32.s32 %df0, %dot0;
+    cvt.rn.f32.s32 %df1, %dot1;
+    mul.f32 %sc0, %dw0, %dx;
+    mul.f32 %sc1, %dw1, %dx;
+    fma.rn.f32 %sum0, %df0, %sc0, %sum0;
+    fma.rn.f32 %sum1, %df1, %sc1, %sum1;
+    add.u64 %wscale0, %wscale0, 18;
+    add.u64 %wscale1, %wscale1, 18;
+    add.u64 %wsign0, %wsign0, 18;
+    add.u64 %wsign1, %wsign1, 18;
+    add.u64 %xgroup, %xgroup, 136;
+    add.u32 %b, %b, 1;
+    bra $L_q12_loop;
+
+$L_q12_reduce:
+    shfl.sync.down.b32 %sh0, %sum0, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 16, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 8, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 4, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 2, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 1, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    setp.eq.u32 %p_lane0, %lane, 0;
+    @!%p_lane0 ret;
+    mul.wide.u32 %outaddr, %row0, 4;
+    add.u64 %outaddr, %output, %outaddr;
+    st.global.f32 [%outaddr], %sum0;
+    @!%p_row1 ret;
+    add.u64 %outaddr, %outaddr, 4;
+    st.global.f32 [%outaddr], %sum1;
+    ret;
+}
+
+// Q1_0 v3: four rows per warp, one 8-lane subgroup per row. Accumulation maps
+// to the eight AVX lanes used by the CPU Q1xQ8 reference path.
+.visible .entry gemv_q1_0_v3(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_bad, %p_done, %p_add, %p_store, %p_initwarp, %p_initlane, %p_init;
+    .reg .b16 %hw, %hx;
+    .reg .b32 %lane, %subgroup, %sublane, %warp, %row, %cols, %rows, %nb, %b, %chunk;
+    .reg .b32 %t0, %t1, %byte_idx, %shift, %raw, %bits;
+    .reg .b32 %a0, %a1, %a2, %a3, %sign32, %q32, %dot;
+    .reg .b64 %weights, %input, %output, %stride, %row64, %roff;
+    .reg .b64 %wptr, %boff, %addr, %off, %outaddr, %lutbase, %lutaddr, %constbase, %xgroup;
+    .reg .f32 %dw, %dx, %scale, %dotf, %sum, %sh;
+    .shared .align 4 .b8 q13_sign_lut[64];
+
+    mov.u32 %lane, %tid.x;
+    shr.u32 %subgroup, %lane, 3;
+    and.b32 %sublane, %lane, 7;
+    mov.u32 %warp, %tid.y;
+    mov.u64 %lutbase, q13_sign_lut;
+    setp.eq.u32 %p_initwarp, %warp, 0;
+    setp.lt.u32 %p_initlane, %lane, 16;
+    and.pred %p_init, %p_initwarp, %p_initlane;
+    @%p_init mov.u64 %constbase, q1_sign_lut;
+    @%p_init shl.b32 %t0, %lane, 2;
+    @%p_init cvt.u64.u32 %lutaddr, %t0;
+    @%p_init add.u64 %addr, %constbase, %lutaddr;
+    @%p_init ld.const.u32 %sign32, [%addr];
+    @%p_init add.u64 %lutaddr, %lutbase, %lutaddr;
+    @%p_init st.shared.u32 [%lutaddr], %sign32;
+    bar.sync 0;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp;
+    shl.b32 %row, %row, 2;
+    add.u32 %row, %row, %subgroup;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_bad, %row, %rows;
+    @%p_bad ret;
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    shr.u32 %nb, %cols, 7;
+    mul.wide.u32 %stride, %nb, 18;
+    cvt.u64.u32 %row64, %row;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wptr, %weights, %roff;
+    mov.u64 %xgroup, %input;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+$L_q13_block:
+    setp.ge.u32 %p_done, %b, %nb;
+    @%p_done bra $L_q13_reduce;
+    mov.u64 %boff, %wptr;
+    ld.global.cs.u16 %hw, [%boff];
+    cvt.f32.f16 %dw, %hw;
+    mov.u32 %chunk, 0;
+$L_q13_chunk:
+    shl.b32 %byte_idx, %chunk, 2;
+    shr.u32 %t0, %sublane, 1;
+    add.u32 %byte_idx, %byte_idx, %t0;
+    and.b32 %shift, %sublane, 1;
+    shl.b32 %shift, %shift, 2;
+    cvt.u64.u32 %off, %byte_idx;
+    add.u64 %addr, %boff, %off;
+    add.u64 %addr, %addr, 2;
+    ld.global.cs.u8 %raw, [%addr];
+    shr.u32 %bits, %raw, %shift;
+    and.b32 %bits, %bits, 15;
+    shl.b32 %t0, %bits, 2;
+    cvt.u64.u32 %lutaddr, %t0;
+    add.u64 %lutaddr, %lutbase, %lutaddr;
+    ld.shared.u32 %sign32, [%lutaddr];
+
+    mov.u64 %addr, %xgroup;
+    shl.b32 %t0, %chunk, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %off, %addr, %off;
+    ld.global.u16 %hx, [%off];
+    cvt.f32.f16 %dx, %hx;
+    shl.b32 %t0, %chunk, 5;
+    shl.b32 %t1, %sublane, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %off, %addr, %off;
+    ld.global.u32 %q32, [%off];
+    dp4a.s32.s32 %dot, %sign32, %q32, 0;
+    cvt.rn.f32.s32 %dotf, %dot;
+    mul.f32 %scale, %dw, %dx;
+    fma.rn.f32 %sum, %dotf, %scale, %sum;
+    add.u32 %chunk, %chunk, 1;
+    setp.lt.u32 %p_done, %chunk, 4;
+    @%p_done bra $L_q13_chunk;
+    add.u64 %wptr, %wptr, 18;
+    add.u64 %xgroup, %xgroup, 136;
+    add.u32 %b, %b, 1;
+    bra $L_q13_block;
+
+$L_q13_reduce:
+    // Match AVX hsum: pair low/high halves, then adjacent pairs.
+    shfl.sync.down.b32 %sh, %sum, 4, 0x1f, 0xffffffff;
+    setp.lt.u32 %p_add, %sublane, 4;
+    @%p_add add.f32 %sum, %sum, %sh;
+    shfl.sync.down.b32 %sh, %sum, 1, 0x1f, 0xffffffff;
+    and.b32 %t0, %sublane, 1;
+    setp.eq.u32 %p_add, %t0, 0;
+    @%p_add add.f32 %sum, %sum, %sh;
+    shfl.sync.down.b32 %sh, %sum, 2, 0x1f, 0xffffffff;
+    setp.eq.u32 %p_add, %sublane, 0;
+    @%p_add add.f32 %sum, %sum, %sh;
+    setp.eq.u32 %p_store, %sublane, 0;
+    @!%p_store ret;
+    mul.wide.u32 %outaddr, %row, 4;
+    add.u64 %outaddr, %output, %outaddr;
+    st.global.f32 [%outaddr], %sum;
+    ret;
+}
+
+// Q1_0 bit-plane GEMV: eight rows per warp (four lanes per row). Activations
+// are stored per 128 columns as [4 scales][4 x 8 u32 bitplanes][4 x 8 counts].
+.visible .entry gemv_q1_0_bitplane(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_bad, %p_done, %p_more, %p_signbit, %p_add, %p_store;
+    .reg .b16 %hw, %hx;
+    .reg .b32 %lane, %subgroup, %sublane, %warp, %row, %cols, %rows, %nb, %b;
+    .reg .b32 %tile, %t0, %t1, %signs, %plane, %masked;
+    .reg .b32 %count, %positive, %term, %bit, %isum;
+    .reg .b64 %weights, %input, %output, %stride, %row64, %roff, %wrow;
+    .reg .b64 %wbase, %xbase, %addr, %off, %planep, %countp, %outaddr;
+    .reg .f32 %dw, %dx, %scale, %dotf, %sum, %sh;
+
+    mov.u32 %lane, %tid.x;
+    shr.u32 %subgroup, %lane, 2;
+    and.b32 %sublane, %lane, 3;
+    mov.u32 %warp, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp;
+    shl.b32 %row, %row, 3;
+    add.u32 %row, %row, %subgroup;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_bad, %row, %rows;
+    @%p_bad ret;
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    shr.u32 %nb, %cols, 7;
+    mul.wide.u32 %stride, %nb, 144;
+    shr.u32 %tile, %row, 3;
+    cvt.u64.u32 %row64, %tile;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wrow, %weights, %roff;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+$L_q1bp_block:
+    setp.ge.u32 %p_done, %b, %nb;
+    @%p_done bra $L_q1bp_reduce;
+    mul.wide.u32 %wbase, %b, 144;
+    add.u64 %wbase, %wrow, %wbase;
+    shl.b32 %t0, %subgroup, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %wbase, %off;
+    ld.global.cs.u16 %hw, [%addr];
+    cvt.f32.f16 %dw, %hw;
+    shl.b32 %t0, %subgroup, 4;
+    shl.b32 %t1, %sublane, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 16;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %wbase, %off;
+    ld.global.cs.u32 %signs, [%addr];
+
+    mul.wide.u32 %xbase, %b, 168;
+    add.u64 %xbase, %input, %xbase;
+    shl.b32 %t0, %sublane, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xbase, %off;
+    ld.global.u16 %hx, [%addr];
+    cvt.f32.f16 %dx, %hx;
+    shl.b32 %t0, %sublane, 5;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %planep, %xbase, %off;
+    shl.b32 %t0, %sublane, 3;
+    add.u32 %t0, %t0, 136;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %countp, %xbase, %off;
+
+    mov.u32 %bit, 0;
+    mov.s32 %isum, 0;
+$L_q1bp_bit:
+    ld.global.u32 %plane, [%planep];
+    ld.global.u8 %count, [%countp];
+    and.b32 %masked, %signs, %plane;
+    popc.b32 %positive, %masked;
+    shl.b32 %positive, %positive, 1;
+    sub.s32 %term, %positive, %count;
+    setp.eq.u32 %p_signbit, %bit, 7;
+    @!%p_signbit shl.b32 %term, %term, %bit;
+    @%p_signbit shl.b32 %term, %term, 7;
+    @%p_signbit neg.s32 %term, %term;
+    add.s32 %isum, %isum, %term;
+    add.u64 %planep, %planep, 4;
+    add.u64 %countp, %countp, 1;
+    add.u32 %bit, %bit, 1;
+    setp.lt.u32 %p_more, %bit, 8;
+    @%p_more bra $L_q1bp_bit;
+
+    cvt.rn.f32.s32 %dotf, %isum;
+    mul.f32 %scale, %dw, %dx;
+    fma.rn.f32 %sum, %dotf, %scale, %sum;
+    add.u32 %b, %b, 1;
+    bra $L_q1bp_block;
+
+$L_q1bp_reduce:
+    shfl.sync.down.b32 %sh, %sum, 2, 0x1f, 0xffffffff;
+    setp.lt.u32 %p_add, %sublane, 2;
+    @%p_add add.f32 %sum, %sum, %sh;
+    shfl.sync.down.b32 %sh, %sum, 1, 0x1f, 0xffffffff;
+    setp.eq.u32 %p_add, %sublane, 0;
+    @%p_add add.f32 %sum, %sum, %sh;
+    setp.eq.u32 %p_store, %sublane, 0;
+    @!%p_store ret;
+    mul.wide.u32 %outaddr, %row, 4;
+    add.u64 %outaddr, %output, %outaddr;
+    st.global.f32 [%outaddr], %sum;
+    ret;
+}
+
+// Q1_0 with per-matrix affine U10 scales. Four scales occupy five bytes;
+// signs remain one bit/weight. Two output rows share compact-Q8 activations.
+.visible .entry gemv_q1_0_u10(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows,
+    .param .f32 scale_min,
+    .param .f32 scale_step
+)
+{
+    .reg .pred %p_bad, %p_row1, %p_done, %p_lane0, %p_initwarp, %p_initlane, %p_init;
+    .reg .b16 %hx, %sg0, %sg1;
+    .reg .b32 %lane, %warp, %row0, %row1, %cols, %rows, %nb, %ng, %scale_bytes, %b;
+    .reg .b32 %t0, %t1, %byte_idx, %shift, %xb, %xi, %bitpos, %byteoff, %sshift;
+    .reg .b32 %rb0, %rb1, %qscale0, %qscale1, %raw0, %raw1, %bits0, %bits1;
+    .reg .b32 %sign0, %sign1, %q32, %dot0, %dot1;
+    .reg .b64 %weights, %input, %output, %stride, %row64, %roff, %wp0, %wp1;
+    .reg .b64 %signp0, %signp1, %addr, %off, %outaddr, %lutbase, %lutaddr, %constbase, %xgroup;
+    .reg .f32 %smin, %sstep, %qf0, %qf1, %dw0, %dw1, %dx, %sc0, %sc1, %df0, %df1;
+    .reg .f32 %sum0, %sum1, %sh0, %sh1;
+    .shared .align 4 .b8 q1u10_sign_lut[64];
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp, %tid.y;
+    mov.u64 %lutbase, q1u10_sign_lut;
+    setp.eq.u32 %p_initwarp, %warp, 0;
+    setp.lt.u32 %p_initlane, %lane, 16;
+    and.pred %p_init, %p_initwarp, %p_initlane;
+    @%p_init mov.u64 %constbase, q1_sign_lut;
+    @%p_init shl.b32 %t0, %lane, 2;
+    @%p_init cvt.u64.u32 %lutaddr, %t0;
+    @%p_init add.u64 %addr, %constbase, %lutaddr;
+    @%p_init ld.const.u32 %sign0, [%addr];
+    @%p_init add.u64 %lutaddr, %lutbase, %lutaddr;
+    @%p_init st.shared.u32 [%lutaddr], %sign0;
+    bar.sync 0;
+
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row0, %t0, %t1, %warp;
+    shl.b32 %row0, %row0, 1;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_bad, %row0, %rows;
+    @%p_bad ret;
+    add.u32 %row1, %row0, 1;
+    setp.lt.u32 %p_row1, %row1, %rows;
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    ld.param.f32 %smin, [scale_min];
+    ld.param.f32 %sstep, [scale_step];
+    shr.u32 %nb, %cols, 7;
+    shr.u32 %ng, %nb, 2;
+    mul.wide.u32 %stride, %ng, 69;
+    mul.lo.u32 %scale_bytes, %nb, 10;
+    shr.u32 %scale_bytes, %scale_bytes, 3;
+    cvt.u64.u32 %row64, %row0;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wp0, %weights, %roff;
+    cvt.u64.u32 %row64, %row1;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wp1, %weights, %roff;
+    shr.u32 %byte_idx, %lane, 1;
+    and.b32 %shift, %lane, 1;
+    shl.b32 %shift, %shift, 2;
+    shr.u32 %xb, %lane, 3;
+    and.b32 %xi, %lane, 7;
+    cvt.u64.u32 %off, %scale_bytes;
+    add.u64 %signp0, %wp0, %off;
+    add.u64 %signp1, %wp1, %off;
+    cvt.u64.u32 %off, %byte_idx;
+    add.u64 %signp0, %signp0, %off;
+    add.u64 %signp1, %signp1, %off;
+    mov.u64 %xgroup, %input;
+    mov.f32 %sum0, 0.0;
+    mov.f32 %sum1, 0.0;
+    mov.u32 %raw1, 0;
+    setp.eq.u32 %p_lane0, %lane, 0;
+    mov.u32 %b, 0;
+
+$L_q1u10_loop:
+    setp.ge.u32 %p_done, %b, %nb;
+    @%p_done bra $L_q1u10_reduce;
+    mul.lo.u32 %bitpos, %b, 10;
+    shr.u32 %byteoff, %bitpos, 3;
+    and.b32 %sshift, %bitpos, 7;
+    cvt.u64.u32 %off, %byteoff;
+    add.u64 %addr, %wp0, %off;
+    @%p_lane0 ld.global.cs.u8 %rb0, [%addr];
+    add.u64 %addr, %addr, 1;
+    @%p_lane0 ld.global.cs.u8 %rb1, [%addr];
+    @%p_lane0 shl.b32 %rb1, %rb1, 8;
+    @%p_lane0 or.b32 %qscale0, %rb0, %rb1;
+    @%p_lane0 shr.u32 %qscale0, %qscale0, %sshift;
+    @%p_lane0 and.b32 %qscale0, %qscale0, 1023;
+    add.u64 %addr, %wp1, %off;
+    @%p_lane0 ld.global.cs.u8 %rb0, [%addr];
+    add.u64 %addr, %addr, 1;
+    @%p_lane0 ld.global.cs.u8 %rb1, [%addr];
+    @%p_lane0 shl.b32 %rb1, %rb1, 8;
+    @%p_lane0 or.b32 %qscale1, %rb0, %rb1;
+    @%p_lane0 shr.u32 %qscale1, %qscale1, %sshift;
+    @%p_lane0 and.b32 %qscale1, %qscale1, 1023;
+    @%p_lane0 cvt.rn.f32.u32 %qf0, %qscale0;
+    @%p_lane0 cvt.rn.f32.u32 %qf1, %qscale1;
+    @%p_lane0 fma.rn.f32 %dw0, %qf0, %sstep, %smin;
+    @%p_lane0 fma.rn.f32 %dw1, %qf1, %sstep, %smin;
+    shfl.sync.idx.b32 %dw0, %dw0, 0, 0x1f, 0xffffffff;
+    shfl.sync.idx.b32 %dw1, %dw1, 0, 0x1f, 0xffffffff;
+
+    ld.global.cs.u8 %raw0, [%signp0];
+    @%p_row1 ld.global.cs.u8 %raw1, [%signp1];
+    shr.u32 %bits0, %raw0, %shift;
+    and.b32 %bits0, %bits0, 15;
+    shl.b32 %t0, %bits0, 2;
+    cvt.u64.u32 %lutaddr, %t0;
+    add.u64 %lutaddr, %lutbase, %lutaddr;
+    ld.shared.u32 %sign0, [%lutaddr];
+    shr.u32 %bits1, %raw1, %shift;
+    and.b32 %bits1, %bits1, 15;
+    shl.b32 %t0, %bits1, 2;
+    cvt.u64.u32 %lutaddr, %t0;
+    add.u64 %lutaddr, %lutbase, %lutaddr;
+    ld.shared.u32 %sign1, [%lutaddr];
+
+    shl.b32 %t0, %xb, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xgroup, %off;
+    ld.global.u16 %hx, [%addr];
+    cvt.f32.f16 %dx, %hx;
+    shl.b32 %t0, %xb, 5;
+    shl.b32 %t1, %xi, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xgroup, %off;
+    ld.global.u32 %q32, [%addr];
+    dp4a.s32.s32 %dot0, %sign0, %q32, 0;
+    dp4a.s32.s32 %dot1, %sign1, %q32, 0;
+    cvt.rn.f32.s32 %df0, %dot0;
+    cvt.rn.f32.s32 %df1, %dot1;
+    mul.f32 %sc0, %dw0, %dx;
+    mul.f32 %sc1, %dw1, %dx;
+    fma.rn.f32 %sum0, %df0, %sc0, %sum0;
+    fma.rn.f32 %sum1, %df1, %sc1, %sum1;
+    add.u64 %signp0, %signp0, 16;
+    add.u64 %signp1, %signp1, 16;
+    add.u64 %xgroup, %xgroup, 136;
+    add.u32 %b, %b, 1;
+    bra $L_q1u10_loop;
+
+$L_q1u10_reduce:
+    shfl.sync.down.b32 %sh0, %sum0, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 16, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 8, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 4, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 2, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    shfl.sync.down.b32 %sh0, %sum0, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %sh1, %sum1, 1, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %sh0;
+    add.f32 %sum1, %sum1, %sh1;
+    @!%p_lane0 ret;
+    mul.wide.u32 %outaddr, %row0, 4;
+    add.u64 %outaddr, %output, %outaddr;
+    st.global.f32 [%outaddr], %sum0;
+    @!%p_row1 ret;
+    add.u64 %outaddr, %outaddr, 4;
+    st.global.f32 [%outaddr], %sum1;
+    ret;
+}
+
+// Q1_0 PRMT kernel: 8 rows/warp, 4 lanes/row, 32 weights/lane. Mirrors the
+// llama.cpp Q1xQ8 byte-permute + dp4a strategy.
+.visible .entry gemv_q1_0_prmt(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_bad, %p_done, %p_add, %p_store, %p_more, %p_initwarp, %p_initlane, %p_init;
+    .reg .b16 %hw, %hx, %sg0, %sg1;
+    .reg .b32 %lane, %subgroup, %sublane, %warp, %row, %cols, %rows, %nb, %b;
+    .reg .b32 %tile, %t0, %t1, %signbits, %q16, %n0, %n1, %s0, %s1, %s2, %s3;
+    .reg .b32 %v0, %v1, %v2, %v3, %u0, %u1, %u2, %u3, %isum;
+    .reg .b64 %weights, %input, %output, %stride, %row64, %roff, %wrow;
+    .reg .b64 %wbase, %xbase, %addr, %off, %qptr, %outaddr, %lutbase, %lutaddr, %constbase;
+    .reg .f32 %dw, %dx, %scale, %dotf, %sum, %sh;
+    .shared .align 4 .b8 q1pr_sign_lut[64];
+
+    mov.u32 %lane, %tid.x;
+    shr.u32 %subgroup, %lane, 2;
+    and.b32 %sublane, %lane, 3;
+    mov.u32 %warp, %tid.y;
+    mov.u64 %lutbase, q1pr_sign_lut;
+    setp.eq.u32 %p_initwarp, %warp, 0;
+    setp.lt.u32 %p_initlane, %lane, 16;
+    and.pred %p_init, %p_initwarp, %p_initlane;
+    @%p_init mov.u64 %constbase, q1_sign_lut;
+    @%p_init shl.b32 %t0, %lane, 2;
+    @%p_init cvt.u64.u32 %lutaddr, %t0;
+    @%p_init add.u64 %addr, %constbase, %lutaddr;
+    @%p_init ld.const.u32 %v0, [%addr];
+    @%p_init add.u64 %lutaddr, %lutbase, %lutaddr;
+    @%p_init st.shared.u32 [%lutaddr], %v0;
+    bar.sync 0;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp;
+    shl.b32 %row, %row, 3;
+    add.u32 %row, %row, %subgroup;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_bad, %row, %rows;
+    @%p_bad ret;
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    shr.u32 %nb, %cols, 7;
+    mul.wide.u32 %stride, %nb, 144;
+    shr.u32 %tile, %row, 3;
+    cvt.u64.u32 %row64, %tile;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wrow, %weights, %roff;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+$L_q1pr_block:
+    setp.ge.u32 %p_done, %b, %nb;
+    @%p_done bra $L_q1pr_reduce;
+    mul.wide.u32 %wbase, %b, 144;
+    add.u64 %wbase, %wrow, %wbase;
+    shl.b32 %t0, %subgroup, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %wbase, %off;
+    ld.global.cs.u16 %hw, [%addr];
+    cvt.f32.f16 %dw, %hw;
+    shl.b32 %t0, %subgroup, 4;
+    shl.b32 %t1, %sublane, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 16;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %wbase, %off;
+    ld.global.cs.u16 %sg0, [%addr];
+    add.u64 %addr, %addr, 2;
+    ld.global.cs.u16 %sg1, [%addr];
+    cvt.u32.u16 %signbits, %sg0;
+    cvt.u32.u16 %t1, %sg1;
+    shl.b32 %t1, %t1, 16;
+    or.b32 %signbits, %signbits, %t1;
+
+    mul.wide.u32 %xbase, %b, 136;
+    add.u64 %xbase, %input, %xbase;
+    shl.b32 %t0, %sublane, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xbase, %off;
+    ld.global.u16 %hx, [%addr];
+    cvt.f32.f16 %dx, %hx;
+    shl.b32 %t0, %sublane, 5;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %qptr, %xbase, %off;
+    mov.s32 %isum, 0;
+
+    // First 16 signs / activations. Mask selector nibbles to match CUDA
+    // __byte_perm (PTX prmt otherwise treats selectors 8..15 specially).
+    and.b32 %q16, %signbits, 0xffff;
+    and.b32 %t0, %q16, 0x7777;
+    prmt.b32 %n0, 0x11100100, 0x11100100, %t0;
+    shr.u32 %t0, %q16, 2;
+    and.b32 %t0, %t0, 0x7777;
+    prmt.b32 %n1, 0x11100100, 0x11100100, %t0;
+    prmt.b32 %s0, 0x000001ff, 0x000001ff, %n0;
+    prmt.b32 %s1, 0x000001ff, 0x000001ff, %n1;
+    shr.u32 %t0, %n0, 16;
+    prmt.b32 %s2, 0x000001ff, 0x000001ff, %t0;
+    shr.u32 %t0, %n1, 16;
+    prmt.b32 %s3, 0x000001ff, 0x000001ff, %t0;
+    prmt.b32 %v0, %s0, %s1, 0x00005410;
+    prmt.b32 %v1, %s0, %s1, 0x00007632;
+    prmt.b32 %v2, %s2, %s3, 0x00005410;
+    prmt.b32 %v3, %s2, %s3, 0x00007632;
+    ld.global.u32 %u0, [%qptr];
+    ld.global.u32 %u1, [%qptr+4];
+    ld.global.u32 %u2, [%qptr+8];
+    ld.global.u32 %u3, [%qptr+12];
+    dp4a.s32.s32 %isum, %v0, %u0, %isum;
+    dp4a.s32.s32 %isum, %v1, %u1, %isum;
+    dp4a.s32.s32 %isum, %v2, %u2, %isum;
+    dp4a.s32.s32 %isum, %v3, %u3, %isum;
+
+    // Second 16 signs / activations.
+    shr.u32 %q16, %signbits, 16;
+    and.b32 %t0, %q16, 0x7777;
+    prmt.b32 %n0, 0x11100100, 0x11100100, %t0;
+    shr.u32 %t0, %q16, 2;
+    and.b32 %t0, %t0, 0x7777;
+    prmt.b32 %n1, 0x11100100, 0x11100100, %t0;
+    prmt.b32 %s0, 0x000001ff, 0x000001ff, %n0;
+    prmt.b32 %s1, 0x000001ff, 0x000001ff, %n1;
+    shr.u32 %t0, %n0, 16;
+    prmt.b32 %s2, 0x000001ff, 0x000001ff, %t0;
+    shr.u32 %t0, %n1, 16;
+    prmt.b32 %s3, 0x000001ff, 0x000001ff, %t0;
+    prmt.b32 %v0, %s0, %s1, 0x00005410;
+    prmt.b32 %v1, %s0, %s1, 0x00007632;
+    prmt.b32 %v2, %s2, %s3, 0x00005410;
+    prmt.b32 %v3, %s2, %s3, 0x00007632;
+    ld.global.u32 %u0, [%qptr+16];
+    ld.global.u32 %u1, [%qptr+20];
+    ld.global.u32 %u2, [%qptr+24];
+    ld.global.u32 %u3, [%qptr+28];
+    dp4a.s32.s32 %isum, %v0, %u0, %isum;
+    dp4a.s32.s32 %isum, %v1, %u1, %isum;
+    dp4a.s32.s32 %isum, %v2, %u2, %isum;
+    dp4a.s32.s32 %isum, %v3, %u3, %isum;
+
+    cvt.rn.f32.s32 %dotf, %isum;
+    mul.f32 %scale, %dw, %dx;
+    fma.rn.f32 %sum, %dotf, %scale, %sum;
+    add.u32 %b, %b, 1;
+    bra $L_q1pr_block;
+
+$L_q1pr_reduce:
+    shfl.sync.down.b32 %sh, %sum, 2, 0x1f, 0xffffffff;
+    setp.lt.u32 %p_add, %sublane, 2;
+    @%p_add add.f32 %sum, %sum, %sh;
+    shfl.sync.down.b32 %sh, %sum, 1, 0x1f, 0xffffffff;
+    setp.eq.u32 %p_add, %sublane, 0;
+    @%p_add add.f32 %sum, %sum, %sh;
+    setp.eq.u32 %p_store, %sublane, 0;
+    @!%p_store ret;
+    mul.wide.u32 %outaddr, %row, 4;
+    add.u64 %outaddr, %output, %outaddr;
+    st.global.f32 [%outaddr], %sum;
+    ret;
+}
+
+// Tiled Q1_0 with U10 affine scales: 8 rows/warp, 4 lanes/row.
+.visible .entry gemv_q1_0_u10_tiled(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows,
+    .param .f32 scale_min,
+    .param .f32 scale_step
+)
+{
+    .reg .pred %p_bad, %p_done, %p_add, %p_store, %p_more, %p_scale_lane;
+    .reg .pred %p_initwarp, %p_initlane, %p_init;
+    .reg .b16 %hx, %sg0, %sg1;
+    .reg .b32 %lane, %subgroup, %sublane, %warp, %row, %cols, %rows, %nb, %b;
+    .reg .b32 %tile, %t0, %t1, %bitpos, %byteoff, %sshift, %rb0, %rb1, %qscale;
+    .reg .b32 %signbits, %nibble, %sign32, %q32, %isum, %iter, %source_lane;
+    .reg .b64 %weights, %input, %output, %stride, %row64, %roff, %wrow;
+    .reg .b64 %wbase, %xbase, %addr, %off, %qptr, %outaddr, %lutbase, %lutaddr, %constbase;
+    .reg .f32 %smin, %sstep, %qf, %dw, %dx, %scale, %dotf, %sum, %sh;
+    .shared .align 4 .b8 q1u10t_sign_lut[64];
+
+    mov.u32 %lane, %tid.x;
+    shr.u32 %subgroup, %lane, 2;
+    and.b32 %sublane, %lane, 3;
+    mov.u32 %warp, %tid.y;
+    mov.u64 %lutbase, q1u10t_sign_lut;
+    setp.eq.u32 %p_initwarp, %warp, 0;
+    setp.lt.u32 %p_initlane, %lane, 16;
+    and.pred %p_init, %p_initwarp, %p_initlane;
+    @%p_init mov.u64 %constbase, q1_sign_lut;
+    @%p_init shl.b32 %t0, %lane, 2;
+    @%p_init cvt.u64.u32 %lutaddr, %t0;
+    @%p_init add.u64 %addr, %constbase, %lutaddr;
+    @%p_init ld.const.u32 %sign32, [%addr];
+    @%p_init add.u64 %lutaddr, %lutbase, %lutaddr;
+    @%p_init st.shared.u32 [%lutaddr], %sign32;
+    bar.sync 0;
+
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp;
+    shl.b32 %row, %row, 3;
+    add.u32 %row, %row, %subgroup;
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_bad, %row, %rows;
+    @%p_bad ret;
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+    ld.param.f32 %smin, [scale_min];
+    ld.param.f32 %sstep, [scale_step];
+    shr.u32 %nb, %cols, 7;
+    mul.wide.u32 %stride, %nb, 138;
+    shr.u32 %tile, %row, 3;
+    cvt.u64.u32 %row64, %tile;
+    mul.lo.u64 %roff, %stride, %row64;
+    add.u64 %wrow, %weights, %roff;
+    setp.eq.u32 %p_scale_lane, %sublane, 0;
+    shl.b32 %source_lane, %subgroup, 2;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+$L_q1ut_block:
+    setp.ge.u32 %p_done, %b, %nb;
+    @%p_done bra $L_q1ut_reduce;
+    mul.wide.u32 %wbase, %b, 138;
+    add.u64 %wbase, %wrow, %wbase;
+    mul.lo.u32 %bitpos, %subgroup, 10;
+    shr.u32 %byteoff, %bitpos, 3;
+    and.b32 %sshift, %bitpos, 7;
+    @%p_scale_lane cvt.u64.u32 %off, %byteoff;
+    @%p_scale_lane add.u64 %addr, %wbase, %off;
+    @%p_scale_lane ld.global.cs.u8 %rb0, [%addr];
+    @%p_scale_lane add.u64 %addr, %addr, 1;
+    @%p_scale_lane ld.global.cs.u8 %rb1, [%addr];
+    @%p_scale_lane shl.b32 %rb1, %rb1, 8;
+    @%p_scale_lane or.b32 %qscale, %rb0, %rb1;
+    @%p_scale_lane shr.u32 %qscale, %qscale, %sshift;
+    @%p_scale_lane and.b32 %qscale, %qscale, 1023;
+    @%p_scale_lane cvt.rn.f32.u32 %qf, %qscale;
+    @%p_scale_lane fma.rn.f32 %dw, %qf, %sstep, %smin;
+    shfl.sync.idx.b32 %dw, %dw, %source_lane, 0x1f, 0xffffffff;
+
+    shl.b32 %t0, %subgroup, 4;
+    shl.b32 %t1, %sublane, 2;
+    add.u32 %t0, %t0, %t1;
+    add.u32 %t0, %t0, 10;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %wbase, %off;
+    ld.global.cs.u16 %sg0, [%addr];
+    add.u64 %addr, %addr, 2;
+    ld.global.cs.u16 %sg1, [%addr];
+    cvt.u32.u16 %signbits, %sg0;
+    cvt.u32.u16 %t1, %sg1;
+    shl.b32 %t1, %t1, 16;
+    or.b32 %signbits, %signbits, %t1;
+    mul.wide.u32 %xbase, %b, 136;
+    add.u64 %xbase, %input, %xbase;
+    shl.b32 %t0, %sublane, 1;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %addr, %xbase, %off;
+    ld.global.u16 %hx, [%addr];
+    cvt.f32.f16 %dx, %hx;
+    shl.b32 %t0, %sublane, 5;
+    add.u32 %t0, %t0, 8;
+    cvt.u64.u32 %off, %t0;
+    add.u64 %qptr, %xbase, %off;
+    mov.s32 %isum, 0;
+    mov.u32 %iter, 0;
+$L_q1ut_nibble:
+    and.b32 %nibble, %signbits, 15;
+    shl.b32 %nibble, %nibble, 2;
+    cvt.u64.u32 %lutaddr, %nibble;
+    add.u64 %lutaddr, %lutbase, %lutaddr;
+    ld.shared.u32 %sign32, [%lutaddr];
+    ld.global.u32 %q32, [%qptr];
+    dp4a.s32.s32 %isum, %sign32, %q32, %isum;
+    shr.u32 %signbits, %signbits, 4;
+    add.u64 %qptr, %qptr, 4;
+    add.u32 %iter, %iter, 1;
+    setp.lt.u32 %p_more, %iter, 8;
+    @%p_more bra $L_q1ut_nibble;
+    cvt.rn.f32.s32 %dotf, %isum;
+    mul.f32 %scale, %dw, %dx;
+    fma.rn.f32 %sum, %dotf, %scale, %sum;
+    add.u32 %b, %b, 1;
+    bra $L_q1ut_block;
+
+$L_q1ut_reduce:
+    shfl.sync.down.b32 %sh, %sum, 2, 0x1f, 0xffffffff;
+    setp.lt.u32 %p_add, %sublane, 2;
+    @%p_add add.f32 %sum, %sum, %sh;
+    shfl.sync.down.b32 %sh, %sum, 1, 0x1f, 0xffffffff;
+    setp.eq.u32 %p_add, %sublane, 0;
+    @%p_add add.f32 %sum, %sum, %sh;
+    setp.eq.u32 %p_store, %sublane, 0;
+    @!%p_store ret;
+    mul.wide.u32 %outaddr, %row, 4;
+    add.u64 %outaddr, %output, %outaddr;
+    st.global.f32 [%outaddr], %sum;
+    ret;
+}
+
+.visible .entry gemv_ternary(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p0, %p1, %p2, %p_base3, %p_qh, %p_loop;
+    .reg .b16 %h_scale;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %byte_idx, %raw_byte, %code, %is_pos, %is_neg, %sign_i;
+    .reg .b32 %j, %act_idx, %qh_lane;
+    .reg .b64 %w_ptr, %in_ptr, %out_ptr, %row_offset, %row_stride_64;
+    .reg .b64 %block_offset, %addr, %act_addr, %out_offset, %row_64;
+    .reg .f32 %scale, %sign_f, %act, %block_sum, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %w_ptr, [weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 7; // cols / 128
+
+    // PTQ1_0 is 28 bytes per 128 elements: row_stride = (cols / 128) * 28
+    mul.wide.u32 %row_stride_64, %num_blocks, 28;
+    cvt.u64.u32 %row_64, %row;
+    mul.lo.u64 %row_offset, %row_stride_64, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_offset;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_ternary:
+    setp.ge.u32 %p1, %b, %num_blocks;
+    @%p1 bra $L_reduce_ternary;
+
+    mul.wide.u32 %block_offset, %b, 28;
+    add.u64 %block_offset, %w_ptr, %block_offset;
+
+    add.u64 %addr, %block_offset, 26;
+    ld.global.u16 %h_scale, [%addr];
+    cvt.f32.f16 %scale, %h_scale;
+
+    // Lanes 0..23 each decode one base-3 byte (five trits = 120).
+    // Lanes 24..25 each decode one packed 2-bit tail byte (four trits = 8).
+    mov.f32 %block_sum, 0.0;
+    setp.lt.u32 %p_base3, %lane, 24;
+    @%p_base3 bra $L_ptq_base3;
+    setp.lt.u32 %p_qh, %lane, 26;
+    @%p_qh bra $L_ptq_qh;
+    bra $L_ptq_accumulate;
+
+$L_ptq_base3:
+    cvt.u64.u32 %addr, %lane;
+    add.u64 %addr, %block_offset, %addr;
+    ld.global.u8 %raw_byte, [%addr];
+    mul.lo.u32 %act_idx, %lane, 5;
+    mul.wide.u32 %act_addr, %b, 512;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    mul.wide.u32 %addr, %act_idx, 4;
+    add.u64 %act_addr, %act_addr, %addr;
+    mov.u32 %j, 0;
+$L_ptq_base3_loop:
+    rem.u32 %code, %raw_byte, 3;
+    div.u32 %raw_byte, %raw_byte, 3;
+    sub.s32 %sign_i, %code, 1;
+    cvt.rn.f32.s32 %sign_f, %sign_i;
+    ld.global.f32 %act, [%act_addr];
+    fma.rn.f32 %block_sum, %sign_f, %act, %block_sum;
+    add.u64 %act_addr, %act_addr, 4;
+    add.u32 %j, %j, 1;
+    setp.lt.u32 %p_loop, %j, 5;
+    @%p_loop bra $L_ptq_base3_loop;
+    bra $L_ptq_accumulate;
+
+$L_ptq_qh:
+    sub.u32 %qh_lane, %lane, 24;
+    cvt.u64.u32 %addr, %qh_lane;
+    add.u64 %addr, %block_offset, %addr;
+    add.u64 %addr, %addr, 24;
+    ld.global.u8 %raw_byte, [%addr];
+    shl.b32 %act_idx, %qh_lane, 2;
+    add.u32 %act_idx, %act_idx, 120;
+    mul.wide.u32 %act_addr, %b, 512;
+    add.u64 %act_addr, %in_ptr, %act_addr;
+    mul.wide.u32 %addr, %act_idx, 4;
+    add.u64 %act_addr, %act_addr, %addr;
+    mov.u32 %j, 0;
+$L_ptq_qh_loop:
+    and.b32 %code, %raw_byte, 3;
+    shr.u32 %raw_byte, %raw_byte, 2;
+    and.b32 %is_pos, %code, 1;
+    shr.u32 %is_neg, %code, 1;
+    and.b32 %is_neg, %is_neg, 1;
+    sub.s32 %sign_i, %is_pos, %is_neg;
+    cvt.rn.f32.s32 %sign_f, %sign_i;
+    ld.global.f32 %act, [%act_addr];
+    fma.rn.f32 %block_sum, %sign_f, %act, %block_sum;
+    add.u64 %act_addr, %act_addr, 4;
+    add.u32 %j, %j, 1;
+    setp.lt.u32 %p_loop, %j, 4;
+    @%p_loop bra $L_ptq_qh_loop;
+
+$L_ptq_accumulate:
+    fma.rn.f32 %sum, %block_sum, %scale, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_ternary;
+
+$L_reduce_ternary:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @!%p2 ret;
+
+    mul.wide.u32 %out_offset, %row, 4;
+    add.u64 %out_offset, %out_ptr, %out_offset;
+    st.global.f32 [%out_offset], %sum;
+
+    ret;
+}
+
+// Q2_0 / 2-bit ternary: 32 weights per 10-byte block (f16 scale + 8 packed bytes).
+// weight = code 1 -> +1, code 2 -> -1, code 0/3 -> 0, scaled by block scale.
+.visible .entry gemv_q2_0(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p<3>;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_blocks, %b;
+    .reg .b32 %t0, %t1, %t3, %byte_idx, %raw_byte, %shift, %code, %is_pos, %is_neg, %sign_i;
+    .reg .b64 %w_ptr, %in_ptr, %out_ptr, %row_offset, %row_stride_64, %block_offset, %lane_offset, %row_64;
+    .reg .f32 %scale, %sign_f, %act, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %w_ptr, [weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %num_blocks, %cols, 5; // cols / 32
+
+    // Q2_0 is 10 bytes per 32 elements: row_stride = (cols / 32) * 10
+    mul.wide.u32 %row_stride_64, %num_blocks, 10;
+    cvt.u64.u32 %row_64, %row;
+    mul.lo.u64 %row_offset, %row_stride_64, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_offset;
+
+    // packed byte index within block: lane / 4; bit shift: (lane % 4) * 2
+    shr.u32 %byte_idx, %lane, 2;
+    and.b32 %shift, %lane, 3;
+    shl.b32 %shift, %shift, 1;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %b, 0;
+
+$L_loop_q2:
+    setp.ge.u32 %p1, %b, %num_blocks;
+    @%p1 bra $L_reduce_q2;
+
+    mul.wide.u32 %block_offset, %b, 10;
+    add.u64 %block_offset, %w_ptr, %block_offset;
+
+    ld.global.u16 %h0, [%block_offset];
+    cvt.f32.f16 %scale, %h0;
+
+    cvt.u64.u32 %lane_offset, %byte_idx;
+    add.u64 %lane_offset, %block_offset, %lane_offset;
+    add.u64 %lane_offset, %lane_offset, 2;
+    ld.global.u8 %raw_byte, [%lane_offset];
+
+    shr.u32 %raw_byte, %raw_byte, %shift;
+    and.b32 %code, %raw_byte, 3;
+    and.b32 %is_pos, %code, 1;
+    shr.u32 %is_neg, %code, 1;
+    and.b32 %is_neg, %is_neg, 1;
+    sub.s32 %sign_i, %is_pos, %is_neg;
+    cvt.rn.f32.s32 %sign_f, %sign_i;
+
+    shl.b32 %t3, %b, 5;
+    add.u32 %t3, %t3, %lane;
+    mul.wide.u32 %lane_offset, %t3, 4;
+    add.u64 %lane_offset, %in_ptr, %lane_offset;
+    ld.global.f32 %act, [%lane_offset];
+
+    mul.f32 %sign_f, %sign_f, %scale;
+    fma.rn.f32 %sum, %sign_f, %act, %sum;
+
+    add.u32 %b, %b, 1;
+    bra $L_loop_q2;
+
+$L_reduce_q2:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @!%p2 ret;
+
+    mul.wide.u32 %lane_offset, %row, 4;
+    add.u64 %lane_offset, %out_ptr, %lane_offset;
+    st.global.f32 [%lane_offset], %sum;
+
+    ret;
+}
+
+// ===================== GPU-resident forward kernels =====================
+
+// One-token Qwen35 Gated DeltaNet update. One block owns a value head; its
+// four warps process four state columns at a time. State is stored transposed
+// as state[head][column][row], matching the CPU/reference implementation.
+.visible .entry gated_delta_f32(
+    .param .u64 state_ptr,
+    .param .u64 q_ptr,
+    .param .u64 k_ptr,
+    .param .u64 v_ptr,
+    .param .u64 decay_ptr,
+    .param .u64 beta_ptr,
+    .param .u64 output_ptr,
+    .param .u32 key_heads,
+    .param .u32 value_heads,
+    .param .u32 head_dim,
+    .param .f32 output_scale
+)
+{
+    .reg .pred %p_gd_bad, %p_gd_done, %p_gd_lane0;
+    .reg .b32 %gd_lane, %gd_warp, %gd_head, %gd_keyhead, %gd_keyheads, %gd_vheads;
+    .reg .b32 %gd_hd, %gd_col, %gd_i, %gd_idx, %gd_t;
+    .reg .b64 %gd_state, %gd_q, %gd_k, %gd_v, %gd_decayp, %gd_betap, %gd_out;
+    .reg .b64 %gd_addr, %gd_colbase, %gd_qbase, %gd_kbase;
+    .reg .f32 %gd_decay, %gd_beta, %gd_s, %gd_qv, %gd_kv, %gd_sum, %gd_sh;
+    .reg .f32 %gd_vv, %gd_delta, %gd_new, %gd_attn, %gd_scale;
+
+    mov.u32 %gd_lane, %tid.x;
+    mov.u32 %gd_warp, %tid.y;
+    mov.u32 %gd_head, %ctaid.x;
+    ld.param.u32 %gd_vheads, [value_heads];
+    setp.ge.u32 %p_gd_bad, %gd_head, %gd_vheads;
+    @%p_gd_bad ret;
+    ld.param.u32 %gd_keyheads, [key_heads];
+    ld.param.u32 %gd_hd, [head_dim];
+    rem.u32 %gd_keyhead, %gd_head, %gd_keyheads;
+    ld.param.u64 %gd_state, [state_ptr];
+    ld.param.u64 %gd_q, [q_ptr];
+    ld.param.u64 %gd_k, [k_ptr];
+    ld.param.u64 %gd_v, [v_ptr];
+    ld.param.u64 %gd_decayp, [decay_ptr];
+    ld.param.u64 %gd_betap, [beta_ptr];
+    ld.param.u64 %gd_out, [output_ptr];
+    ld.param.f32 %gd_scale, [output_scale];
+
+    mul.lo.u32 %gd_t, %gd_head, %gd_hd;
+    mul.lo.u32 %gd_t, %gd_t, %gd_hd;
+    mul.wide.u32 %gd_addr, %gd_t, 4;
+    add.u64 %gd_state, %gd_state, %gd_addr;
+    mul.lo.u32 %gd_t, %gd_keyhead, %gd_hd;
+    mul.wide.u32 %gd_addr, %gd_t, 4;
+    add.u64 %gd_qbase, %gd_q, %gd_addr;
+    add.u64 %gd_kbase, %gd_k, %gd_addr;
+    mul.wide.u32 %gd_addr, %gd_head, 4;
+    add.u64 %gd_decayp, %gd_decayp, %gd_addr;
+    add.u64 %gd_betap, %gd_betap, %gd_addr;
+    ld.global.f32 %gd_decay, [%gd_decayp];
+    ld.global.f32 %gd_beta, [%gd_betap];
+
+    mov.u32 %gd_col, %gd_warp;
+$L_gd_col:
+    setp.ge.u32 %p_gd_done, %gd_col, %gd_hd;
+    @%p_gd_done ret;
+    mul.lo.u32 %gd_t, %gd_col, %gd_hd;
+    mul.wide.u32 %gd_addr, %gd_t, 4;
+    add.u64 %gd_colbase, %gd_state, %gd_addr;
+
+    mov.f32 %gd_sum, 0.0;
+    mov.u32 %gd_i, %gd_lane;
+$L_gd_dot_k:
+    setp.ge.u32 %p_gd_done, %gd_i, %gd_hd;
+    @%p_gd_done bra $L_gd_reduce_k;
+    mul.wide.u32 %gd_addr, %gd_i, 4;
+    add.u64 %gd_addr, %gd_colbase, %gd_addr;
+    ld.global.f32 %gd_s, [%gd_addr];
+    mul.wide.u32 %gd_addr, %gd_i, 4;
+    add.u64 %gd_addr, %gd_kbase, %gd_addr;
+    ld.global.f32 %gd_kv, [%gd_addr];
+    fma.rn.f32 %gd_sum, %gd_s, %gd_kv, %gd_sum;
+    add.u32 %gd_i, %gd_i, 32;
+    bra $L_gd_dot_k;
+$L_gd_reduce_k:
+    shfl.sync.down.b32 %gd_sh, %gd_sum, 16, 0x1f, 0xffffffff;
+    add.f32 %gd_sum, %gd_sum, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_sum, 8, 0x1f, 0xffffffff;
+    add.f32 %gd_sum, %gd_sum, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_sum, 4, 0x1f, 0xffffffff;
+    add.f32 %gd_sum, %gd_sum, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_sum, 2, 0x1f, 0xffffffff;
+    add.f32 %gd_sum, %gd_sum, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_sum, 1, 0x1f, 0xffffffff;
+    add.f32 %gd_sum, %gd_sum, %gd_sh;
+    setp.eq.u32 %p_gd_lane0, %gd_lane, 0;
+    @%p_gd_lane0 mul.lo.u32 %gd_idx, %gd_head, %gd_hd;
+    @%p_gd_lane0 add.u32 %gd_idx, %gd_idx, %gd_col;
+    @%p_gd_lane0 mul.wide.u32 %gd_addr, %gd_idx, 4;
+    @%p_gd_lane0 add.u64 %gd_addr, %gd_v, %gd_addr;
+    @%p_gd_lane0 ld.global.f32 %gd_vv, [%gd_addr];
+    @%p_gd_lane0 mul.f32 %gd_delta, %gd_decay, %gd_sum;
+    @%p_gd_lane0 sub.f32 %gd_delta, %gd_vv, %gd_delta;
+    @%p_gd_lane0 mul.f32 %gd_delta, %gd_delta, %gd_beta;
+    shfl.sync.idx.b32 %gd_delta, %gd_delta, 0, 0x1f, 0xffffffff;
+
+    mov.f32 %gd_attn, 0.0;
+    mov.u32 %gd_i, %gd_lane;
+$L_gd_update:
+    setp.ge.u32 %p_gd_done, %gd_i, %gd_hd;
+    @%p_gd_done bra $L_gd_reduce_q;
+    mul.wide.u32 %gd_addr, %gd_i, 4;
+    add.u64 %gd_addr, %gd_colbase, %gd_addr;
+    ld.global.f32 %gd_s, [%gd_addr];
+    mul.wide.u32 %gd_addr, %gd_i, 4;
+    add.u64 %gd_addr, %gd_kbase, %gd_addr;
+    ld.global.f32 %gd_kv, [%gd_addr];
+    mul.f32 %gd_new, %gd_s, %gd_decay;
+    fma.rn.f32 %gd_new, %gd_kv, %gd_delta, %gd_new;
+    mul.wide.u32 %gd_addr, %gd_i, 4;
+    add.u64 %gd_addr, %gd_colbase, %gd_addr;
+    st.global.f32 [%gd_addr], %gd_new;
+    mul.wide.u32 %gd_addr, %gd_i, 4;
+    add.u64 %gd_addr, %gd_qbase, %gd_addr;
+    ld.global.f32 %gd_qv, [%gd_addr];
+    fma.rn.f32 %gd_attn, %gd_new, %gd_qv, %gd_attn;
+    add.u32 %gd_i, %gd_i, 32;
+    bra $L_gd_update;
+$L_gd_reduce_q:
+    shfl.sync.down.b32 %gd_sh, %gd_attn, 16, 0x1f, 0xffffffff;
+    add.f32 %gd_attn, %gd_attn, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_attn, 8, 0x1f, 0xffffffff;
+    add.f32 %gd_attn, %gd_attn, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_attn, 4, 0x1f, 0xffffffff;
+    add.f32 %gd_attn, %gd_attn, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_attn, 2, 0x1f, 0xffffffff;
+    add.f32 %gd_attn, %gd_attn, %gd_sh;
+    shfl.sync.down.b32 %gd_sh, %gd_attn, 1, 0x1f, 0xffffffff;
+    add.f32 %gd_attn, %gd_attn, %gd_sh;
+    @%p_gd_lane0 mul.f32 %gd_attn, %gd_attn, %gd_scale;
+    @%p_gd_lane0 mul.lo.u32 %gd_idx, %gd_head, %gd_hd;
+    @%p_gd_lane0 add.u32 %gd_idx, %gd_idx, %gd_col;
+    @%p_gd_lane0 mul.wide.u32 %gd_addr, %gd_idx, 4;
+    @%p_gd_lane0 add.u64 %gd_addr, %gd_out, %gd_addr;
+    @%p_gd_lane0 st.global.f32 [%gd_addr], %gd_attn;
+    add.u32 %gd_col, %gd_col, 4;
+    bra $L_gd_col;
+}
+
+// RMSNorm over one warp: out = in * rsqrt(mean(in^2) + eps) * weight
+.visible .entry rmsnorm_f32(
+    .param .u64 out_ptr,
+    .param .u64 in_ptr,
+    .param .u64 weight_ptr,
+    .param .u32 n,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %lane, %n, %i;
+    .reg .b64 %out_ptr, %in_ptr, %w_ptr, %off;
+    .reg .f32 %v, %acc, %sum, %mean, %inv, %w, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    ld.param.u32 %n, [n];
+    ld.param.u64 %out_ptr, [out_ptr];
+    ld.param.u64 %in_ptr, [in_ptr];
+    ld.param.u64 %w_ptr, [weight_ptr];
+
+    mov.f32 %acc, 0.0;
+    mov.u32 %i, %lane;
+
+$L_rms_sq:
+    setp.ge.u32 %p0, %i, %n;
+    @%p0 bra $L_rms_reduce;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %in_ptr, %off;
+    ld.global.f32 %v, [%off];
+    fma.rn.f32 %acc, %v, %v, %acc;
+    add.u32 %i, %i, 32;
+    bra $L_rms_sq;
+
+$L_rms_reduce:
+    shfl.sync.down.b32 %shfl_tmp, %acc, 16, 0x1f, 0xffffffff;
+    add.f32 %acc, %acc, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %acc, 8, 0x1f, 0xffffffff;
+    add.f32 %acc, %acc, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %acc, 4, 0x1f, 0xffffffff;
+    add.f32 %acc, %acc, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %acc, 2, 0x1f, 0xffffffff;
+    add.f32 %acc, %acc, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %acc, 1, 0x1f, 0xffffffff;
+    add.f32 %acc, %acc, %shfl_tmp;
+    shfl.sync.idx.b32 %shfl_tmp, %acc, 0, 0x1f, 0xffffffff;
+    mov.f32 %sum, %shfl_tmp;
+
+    cvt.rn.f32.u32 %v, %n;
+    div.rn.f32 %mean, %sum, %v;
+    ld.param.f32 %inv, [epsilon];
+    add.f32 %mean, %mean, %inv;
+    sqrt.rn.f32 %mean, %mean;
+    rcp.approx.f32 %inv, %mean;
+
+    mov.u32 %i, %lane;
+$L_rms_norm:
+    setp.ge.u32 %p0, %i, %n;
+    @%p0 bra $L_rms_done;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %in_ptr, %off;
+    ld.global.f32 %v, [%off];
+    mul.f32 %v, %v, %inv;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %w_ptr, %off;
+    ld.global.f32 %w, [%off];
+    mul.f32 %v, %v, %w;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %out_ptr, %off;
+    st.global.f32 [%off], %v;
+    add.u32 %i, %i, 32;
+    bra $L_rms_norm;
+$L_rms_done:
+    ret;
+}
+
+// RMSNorm v2: one 256-thread block (8 warps). The original one-warp kernel
+// leaves most of an SM idle and builds a long per-lane FMA dependency chain.
+// Warp partials are combined through 32 bytes of shared memory.
+.visible .entry rmsnorm_f32_v2(
+    .param .u64 out_ptr,
+    .param .u64 in_ptr,
+    .param .u64 weight_ptr,
+    .param .u32 n,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p_r2_done, %p_r2_lane0, %p_r2_warp0, %p_r2_has;
+    .reg .b32 %r2_tid, %r2_lane, %r2_warp, %r2_nt, %r2_n, %r2_i, %r2_nwarps, %r2_soff;
+    .reg .b64 %r2_out, %r2_in, %r2_weight, %r2_off, %r2_addr, %r2_sbase, %r2_saddr;
+    .reg .f32 %r2_v, %r2_acc, %r2_tmp, %r2_nf, %r2_mean, %r2_eps, %r2_inv, %r2_w;
+    .shared .align 4 .b8 rms_v2_smem[32];
+
+    mov.u32 %r2_tid, %tid.x;
+    and.b32 %r2_lane, %r2_tid, 31;
+    shr.u32 %r2_warp, %r2_tid, 5;
+    mov.u32 %r2_nt, %ntid.x;
+    shr.u32 %r2_nwarps, %r2_nt, 5;
+    ld.param.u32 %r2_n, [n];
+    ld.param.u64 %r2_out, [out_ptr];
+    ld.param.u64 %r2_in, [in_ptr];
+    ld.param.u64 %r2_weight, [weight_ptr];
+    mov.u64 %r2_sbase, rms_v2_smem;
+
+    mov.f32 %r2_acc, 0.0;
+    mov.u32 %r2_i, %r2_tid;
+$L_rms2_sq:
+    setp.ge.u32 %p_r2_done, %r2_i, %r2_n;
+    @%p_r2_done bra $L_rms2_warp_reduce;
+    mul.wide.u32 %r2_off, %r2_i, 4;
+    add.u64 %r2_addr, %r2_in, %r2_off;
+    ld.global.f32 %r2_v, [%r2_addr];
+    fma.rn.f32 %r2_acc, %r2_v, %r2_v, %r2_acc;
+    add.u32 %r2_i, %r2_i, %r2_nt;
+    bra $L_rms2_sq;
+
+$L_rms2_warp_reduce:
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+
+    setp.eq.u32 %p_r2_lane0, %r2_lane, 0;
+    mul.lo.u32 %r2_soff, %r2_warp, 4;
+    cvt.u64.u32 %r2_saddr, %r2_soff;
+    add.u64 %r2_saddr, %r2_sbase, %r2_saddr;
+    @%p_r2_lane0 st.shared.f32 [%r2_saddr], %r2_acc;
+    bar.sync 0;
+
+    setp.eq.u32 %p_r2_warp0, %r2_warp, 0;
+    @!%p_r2_warp0 bra $L_rms2_inv_ready;
+    setp.lt.u32 %p_r2_has, %r2_lane, %r2_nwarps;
+    mov.f32 %r2_acc, 0.0;
+    mul.lo.u32 %r2_soff, %r2_lane, 4;
+    cvt.u64.u32 %r2_saddr, %r2_soff;
+    add.u64 %r2_saddr, %r2_sbase, %r2_saddr;
+    @%p_r2_has ld.shared.f32 %r2_acc, [%r2_saddr];
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    shfl.sync.down.b32 %r2_tmp, %r2_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %r2_acc, %r2_acc, %r2_tmp;
+    @!%p_r2_lane0 bra $L_rms2_inv_ready;
+    cvt.rn.f32.u32 %r2_nf, %r2_n;
+    div.rn.f32 %r2_mean, %r2_acc, %r2_nf;
+    ld.param.f32 %r2_eps, [epsilon];
+    add.f32 %r2_mean, %r2_mean, %r2_eps;
+    sqrt.rn.f32 %r2_mean, %r2_mean;
+    rcp.approx.f32 %r2_inv, %r2_mean;
+    st.shared.f32 [rms_v2_smem], %r2_inv;
+
+$L_rms2_inv_ready:
+    bar.sync 0;
+    ld.shared.f32 %r2_inv, [rms_v2_smem];
+    mov.u32 %r2_i, %r2_tid;
+$L_rms2_norm:
+    setp.ge.u32 %p_r2_done, %r2_i, %r2_n;
+    @%p_r2_done bra $L_rms2_done;
+    mul.wide.u32 %r2_off, %r2_i, 4;
+    add.u64 %r2_addr, %r2_in, %r2_off;
+    ld.global.f32 %r2_v, [%r2_addr];
+    mul.f32 %r2_v, %r2_v, %r2_inv;
+    add.u64 %r2_addr, %r2_weight, %r2_off;
+    ld.global.f32 %r2_w, [%r2_addr];
+    mul.f32 %r2_v, %r2_v, %r2_w;
+    add.u64 %r2_addr, %r2_out, %r2_off;
+    st.global.f32 [%r2_addr], %r2_v;
+    add.u32 %r2_i, %r2_i, %r2_nt;
+    bra $L_rms2_norm;
+$L_rms2_done:
+    ret;
+}
+
+// Fused residual update + RMSNorm. Computes dst += src, keeps the rounded
+// residual in dst, and writes RMSNorm(dst) to out. This replaces an add kernel
+// followed by rmsnorm_f32_v2 at every transformer residual boundary.
+.visible .entry add_rmsnorm_f32_v2(
+    .param .u64 out_ptr,
+    .param .u64 dst_ptr,
+    .param .u64 src_ptr,
+    .param .u64 weight_ptr,
+    .param .u32 n,
+    .param .f32 epsilon
+)
+{
+    .reg .pred %p_ar_done, %p_ar_lane0, %p_ar_warp0, %p_ar_has;
+    .reg .b32 %ar_tid, %ar_lane, %ar_warp, %ar_nt, %ar_n, %ar_i, %ar_nwarps, %ar_soff;
+    .reg .b64 %ar_out, %ar_dst, %ar_src, %ar_weight, %ar_off, %ar_addr;
+    .reg .b64 %ar_sbase, %ar_saddr;
+    .reg .f32 %ar_a, %ar_b, %ar_acc, %ar_tmp, %ar_nf, %ar_mean, %ar_eps, %ar_inv, %ar_w;
+    .shared .align 4 .b8 add_rms_v2_smem[32];
+
+    mov.u32 %ar_tid, %tid.x;
+    and.b32 %ar_lane, %ar_tid, 31;
+    shr.u32 %ar_warp, %ar_tid, 5;
+    mov.u32 %ar_nt, %ntid.x;
+    shr.u32 %ar_nwarps, %ar_nt, 5;
+    ld.param.u32 %ar_n, [n];
+    ld.param.u64 %ar_out, [out_ptr];
+    ld.param.u64 %ar_dst, [dst_ptr];
+    ld.param.u64 %ar_src, [src_ptr];
+    ld.param.u64 %ar_weight, [weight_ptr];
+    mov.u64 %ar_sbase, add_rms_v2_smem;
+
+    mov.f32 %ar_acc, 0.0;
+    mov.u32 %ar_i, %ar_tid;
+$L_add_rms_sq:
+    setp.ge.u32 %p_ar_done, %ar_i, %ar_n;
+    @%p_ar_done bra $L_add_rms_warp_reduce;
+    mul.wide.u32 %ar_off, %ar_i, 4;
+    add.u64 %ar_addr, %ar_dst, %ar_off;
+    ld.global.f32 %ar_a, [%ar_addr];
+    add.u64 %ar_addr, %ar_src, %ar_off;
+    ld.global.f32 %ar_b, [%ar_addr];
+    add.f32 %ar_a, %ar_a, %ar_b;
+    add.u64 %ar_addr, %ar_dst, %ar_off;
+    st.global.f32 [%ar_addr], %ar_a;
+    fma.rn.f32 %ar_acc, %ar_a, %ar_a, %ar_acc;
+    add.u32 %ar_i, %ar_i, %ar_nt;
+    bra $L_add_rms_sq;
+
+$L_add_rms_warp_reduce:
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+
+    setp.eq.u32 %p_ar_lane0, %ar_lane, 0;
+    mul.lo.u32 %ar_soff, %ar_warp, 4;
+    cvt.u64.u32 %ar_saddr, %ar_soff;
+    add.u64 %ar_saddr, %ar_sbase, %ar_saddr;
+    @%p_ar_lane0 st.shared.f32 [%ar_saddr], %ar_acc;
+    bar.sync 0;
+
+    setp.eq.u32 %p_ar_warp0, %ar_warp, 0;
+    @!%p_ar_warp0 bra $L_add_rms_inv_ready;
+    setp.lt.u32 %p_ar_has, %ar_lane, %ar_nwarps;
+    mov.f32 %ar_acc, 0.0;
+    mul.lo.u32 %ar_soff, %ar_lane, 4;
+    cvt.u64.u32 %ar_saddr, %ar_soff;
+    add.u64 %ar_saddr, %ar_sbase, %ar_saddr;
+    @%p_ar_has ld.shared.f32 %ar_acc, [%ar_saddr];
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 16, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 8, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 4, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 2, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    shfl.sync.down.b32 %ar_tmp, %ar_acc, 1, 0x1f, 0xffffffff;
+    add.f32 %ar_acc, %ar_acc, %ar_tmp;
+    @!%p_ar_lane0 bra $L_add_rms_inv_ready;
+    cvt.rn.f32.u32 %ar_nf, %ar_n;
+    div.rn.f32 %ar_mean, %ar_acc, %ar_nf;
+    ld.param.f32 %ar_eps, [epsilon];
+    add.f32 %ar_mean, %ar_mean, %ar_eps;
+    sqrt.rn.f32 %ar_mean, %ar_mean;
+    rcp.approx.f32 %ar_inv, %ar_mean;
+    st.shared.f32 [add_rms_v2_smem], %ar_inv;
+
+$L_add_rms_inv_ready:
+    bar.sync 0;
+    ld.shared.f32 %ar_inv, [add_rms_v2_smem];
+    mov.u32 %ar_i, %ar_tid;
+$L_add_rms_norm:
+    setp.ge.u32 %p_ar_done, %ar_i, %ar_n;
+    @%p_ar_done bra $L_add_rms_done;
+    mul.wide.u32 %ar_off, %ar_i, 4;
+    add.u64 %ar_addr, %ar_dst, %ar_off;
+    ld.global.f32 %ar_a, [%ar_addr];
+    mul.f32 %ar_a, %ar_a, %ar_inv;
+    add.u64 %ar_addr, %ar_weight, %ar_off;
+    ld.global.f32 %ar_w, [%ar_addr];
+    mul.f32 %ar_a, %ar_a, %ar_w;
+    add.u64 %ar_addr, %ar_out, %ar_off;
+    st.global.f32 [%ar_addr], %ar_a;
+    add.u32 %ar_i, %ar_i, %ar_nt;
+    bra $L_add_rms_norm;
+$L_add_rms_done:
+    ret;
+}
+
+// dst += src, one thread per element
+.visible .entry add_f32(
+    .param .u64 dst_ptr,
+    .param .u64 src_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %ti, %nt, %ci, %i, %n;
+    .reg .b64 %dst_ptr, %src_ptr, %off;
+    .reg .f32 %a, %b;
+
+    mov.u32 %ti, %tid.x;
+    mov.u32 %nt, %ntid.x;
+    mov.u32 %ci, %ctaid.x;
+    mad.lo.u32 %i, %ci, %nt, %ti;
+    ld.param.u32 %n, [n];
+    ld.param.u64 %dst_ptr, [dst_ptr];
+    ld.param.u64 %src_ptr, [src_ptr];
+
+    setp.ge.u32 %p0, %i, %n;
+    @%p0 ret;
+
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %dst_ptr, %off;
+    ld.global.f32 %a, [%off];
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %src_ptr, %off;
+    ld.global.f32 %b, [%off];
+    add.f32 %a, %a, %b;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %dst_ptr, %off;
+    st.global.f32 [%off], %a;
+    ret;
+}
+
+// dst += bias, one thread per element
+.visible .entry add_bias_f32(
+    .param .u64 dst_ptr,
+    .param .u64 bias_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %ti, %nt, %ci, %i, %n;
+    .reg .b64 %dst_ptr, %bias_ptr, %off;
+    .reg .f32 %a, %b;
+
+    mov.u32 %ti, %tid.x;
+    mov.u32 %nt, %ntid.x;
+    mov.u32 %ci, %ctaid.x;
+    mad.lo.u32 %i, %ci, %nt, %ti;
+    ld.param.u32 %n, [n];
+    ld.param.u64 %dst_ptr, [dst_ptr];
+    ld.param.u64 %bias_ptr, [bias_ptr];
+
+    setp.ge.u32 %p0, %i, %n;
+    @%p0 ret;
+
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %dst_ptr, %off;
+    ld.global.f32 %a, [%off];
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %bias_ptr, %off;
+    ld.global.f32 %b, [%off];
+    add.f32 %a, %a, %b;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %dst_ptr, %off;
+    st.global.f32 [%off], %a;
+    ret;
+}
+
+// gate = gate * sigmoid(gate) * up, one thread per element (no NaN on extremes)
+.visible .entry swiglu_f32(
+    .param .u64 gate_ptr,
+    .param .u64 up_ptr,
+    .param .u32 n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %ti, %nt, %ci, %i, %n;
+    .reg .b64 %gate_ptr, %up_ptr, %off;
+    .reg .f32 %g, %u, %e, %sig;
+
+    mov.u32 %ti, %tid.x;
+    mov.u32 %nt, %ntid.x;
+    mov.u32 %ci, %ctaid.x;
+    mad.lo.u32 %i, %ci, %nt, %ti;
+    ld.param.u32 %n, [n];
+    ld.param.u64 %gate_ptr, [gate_ptr];
+    ld.param.u64 %up_ptr, [up_ptr];
+
+    setp.ge.u32 %p0, %i, %n;
+    @%p0 ret;
+
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %gate_ptr, %off;
+    ld.global.f32 %g, [%off];
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %up_ptr, %off;
+    ld.global.f32 %u, [%off];
+
+    mul.f32 %e, %g, 0fBFB8AA3B;   // -g * log2(e)
+    ex2.approx.f32 %e, %e;
+    add.f32 %e, %e, 1.0;
+    rcp.approx.f32 %sig, %e;
+    mul.f32 %g, %g, %sig;
+    mul.f32 %g, %g, %u;
+    mul.wide.u32 %off, %i, 4;
+    add.u64 %off, %gate_ptr, %off;
+    st.global.f32 [%off], %g;
+    ret;
+}
+
+// NeoX RoPE + KV store. One thread per work item:
+//   [0, n_q_pairs)                    : rope q in place
+//   [n_q_pairs, n_q+n_kv_pairs)       : rope k from d_qkv into k-cache slot
+//   [n_q+n_kv_pairs, +kv_stride)      : copy v from d_qkv into v-cache slot
+// cos_sin layout: [0..half) = cos(idx), [half..head_dim) = sin(idx)
+.visible .entry rope_store_f32(
+    .param .u64 q_ptr,
+    .param .u64 k_src_ptr,
+    .param .u64 v_src_ptr,
+    .param .u64 kcache_ptr,
+    .param .u64 vcache_ptr,
+    .param .u64 cos_sin_ptr,
+    .param .u64 pos_ptr,
+    .param .u32 n_q_pairs,
+    .param .u32 n_kv_pairs,
+    .param .u32 head_dim,
+    .param .u32 kv_stride
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %ti, %nt, %ci, %i, %n_q, %n_kv, %head_dim, %kv_stride, %pos;
+    .reg .b32 %half, %head, %idx, %a_off, %b_off, %dst_off, %j;
+    .reg .b64 %q_ptr, %k_src_ptr, %v_src_ptr, %kcache_ptr, %vcache_ptr, %cos_sin_ptr, %addr, %pos_ptr;
+    .reg .f32 %a, %b, %c, %s, %na, %nb;
+
+    mov.u32 %ti, %tid.x;
+    mov.u32 %nt, %ntid.x;
+    mov.u32 %ci, %ctaid.x;
+    mad.lo.u32 %i, %ci, %nt, %ti;
+
+    ld.param.u32 %n_q, [n_q_pairs];
+    ld.param.u32 %n_kv, [n_kv_pairs];
+    ld.param.u32 %head_dim, [head_dim];
+    ld.param.u32 %kv_stride, [kv_stride];
+    ld.param.u64 %pos_ptr, [pos_ptr];
+    ld.global.u32 %pos, [%pos_ptr];
+    ld.param.u64 %q_ptr, [q_ptr];
+    ld.param.u64 %k_src_ptr, [k_src_ptr];
+    ld.param.u64 %v_src_ptr, [v_src_ptr];
+    ld.param.u64 %kcache_ptr, [kcache_ptr];
+    ld.param.u64 %vcache_ptr, [vcache_ptr];
+    ld.param.u64 %cos_sin_ptr, [cos_sin_ptr];
+
+    shr.u32 %half, %head_dim, 1;
+
+    // --- q rope (in place) ---
+    setp.ge.u32 %p0, %i, %n_q;
+    @%p0 bra $L_rope_k;
+
+    div.u32 %head, %i, %half;
+    rem.u32 %idx, %i, %half;
+    mad.lo.u32 %a_off, %head, %head_dim, %idx;
+    add.u32 %b_off, %a_off, %half;
+
+    mul.wide.u32 %addr, %a_off, 4;
+    add.u64 %addr, %q_ptr, %addr;
+    ld.global.f32 %a, [%addr];
+    mul.wide.u32 %addr, %b_off, 4;
+    add.u64 %addr, %q_ptr, %addr;
+    ld.global.f32 %b, [%addr];
+
+    mul.wide.u32 %addr, %idx, 4;
+    add.u64 %addr, %cos_sin_ptr, %addr;
+    ld.global.f32 %c, [%addr];
+    add.u32 %j, %half, %idx;
+    mul.wide.u32 %addr, %j, 4;
+    add.u64 %addr, %cos_sin_ptr, %addr;
+    ld.global.f32 %s, [%addr];
+
+    mul.f32 %na, %a, %c;
+    mul.f32 %nb, %b, %c;
+    mul.f32 %a, %a, %s;
+    mul.f32 %b, %b, %s;
+    sub.f32 %na, %na, %b;
+    add.f32 %nb, %nb, %a;
+
+    mul.wide.u32 %addr, %a_off, 4;
+    add.u64 %addr, %q_ptr, %addr;
+    st.global.f32 [%addr], %na;
+    mul.wide.u32 %addr, %b_off, 4;
+    add.u64 %addr, %q_ptr, %addr;
+    st.global.f32 [%addr], %nb;
+    ret;
+
+    // --- k rope into cache ---
+$L_rope_k:
+    sub.u32 %j, %i, %n_q;
+    setp.ge.u32 %p0, %j, %n_kv;
+    @%p0 bra $L_copy_v;
+
+    div.u32 %head, %j, %half;
+    rem.u32 %idx, %j, %half;
+    mad.lo.u32 %a_off, %head, %head_dim, %idx;
+    add.u32 %b_off, %a_off, %half;
+
+    mul.wide.u32 %addr, %a_off, 4;
+    add.u64 %addr, %k_src_ptr, %addr;
+    ld.global.f32 %a, [%addr];
+    mul.wide.u32 %addr, %b_off, 4;
+    add.u64 %addr, %k_src_ptr, %addr;
+    ld.global.f32 %b, [%addr];
+
+    mul.wide.u32 %addr, %idx, 4;
+    add.u64 %addr, %cos_sin_ptr, %addr;
+    ld.global.f32 %c, [%addr];
+    add.u32 %j, %half, %idx;
+    mul.wide.u32 %addr, %j, 4;
+    add.u64 %addr, %cos_sin_ptr, %addr;
+    ld.global.f32 %s, [%addr];
+
+    mad.lo.u32 %dst_off, %pos, %kv_stride, %a_off;
+
+    mul.f32 %na, %a, %c;
+    mul.f32 %nb, %b, %c;
+    mul.f32 %a, %a, %s;
+    mul.f32 %b, %b, %s;
+    sub.f32 %na, %na, %b;
+    add.f32 %nb, %nb, %a;
+
+    mul.wide.u32 %addr, %dst_off, 4;
+    add.u64 %addr, %kcache_ptr, %addr;
+    st.global.f32 [%addr], %na;
+    add.u32 %dst_off, %dst_off, %half;
+    mul.wide.u32 %addr, %dst_off, 4;
+    add.u64 %addr, %kcache_ptr, %addr;
+    st.global.f32 [%addr], %nb;
+    ret;
+
+    // --- v copy into cache ---
+$L_copy_v:
+    sub.u32 %j, %i, %n_q;
+    sub.u32 %j, %j, %n_kv;
+    setp.ge.u32 %p0, %j, %kv_stride;
+    @%p0 ret;
+
+    mul.wide.u32 %addr, %j, 4;
+    add.u64 %addr, %v_src_ptr, %addr;
+    ld.global.f32 %a, [%addr];
+    mad.lo.u32 %dst_off, %pos, %kv_stride, %j;
+    mul.wide.u32 %addr, %dst_off, 4;
+    add.u64 %addr, %vcache_ptr, %addr;
+    st.global.f32 [%addr], %a;
+    ret;
+}
+
+// Attention QK scores (v2): one warp per (head, position).
+// q: [head][head_dim]; k cache: [pos][kv_head][head_dim]; scores: [head][max_ctx]
+.visible .entry attn_scores_f32(
+    .param .u64 q_ptr,
+    .param .u64 k_ptr,
+    .param .u64 scores_ptr,
+    .param .u64 pos_ptr,
+    .param .u32 max_ctx,
+    .param .u32 n_heads,
+    .param .u32 kv_heads,
+    .param .u32 head_dim,
+    .param .f32 scale
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %lane, %warp_id, %w, %t0, %total, %pos, %pos1, %head, %p, %group, %kv_head, %d;
+    .reg .b32 %q_off, %k_off, %s_off, %n_heads, %kv_heads, %head_dim, %max_ctx;
+    .reg .b64 %q_ptr, %k_ptr, %scores_ptr, %q_a, %k_a, %s_a, %pos_ptr;
+    .reg .f32 %qv, %kv, %sum, %sc, %scale, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mad.lo.u32 %w, %t0, 4, %warp_id;
+
+    ld.param.u32 %n_heads, [n_heads];
+    ld.param.u64 %pos_ptr, [pos_ptr];
+    ld.global.u32 %pos, [%pos_ptr];
+    ld.param.u32 %kv_heads, [kv_heads];
+    ld.param.u32 %head_dim, [head_dim];
+    ld.param.u32 %max_ctx, [max_ctx];
+    add.u32 %pos1, %pos, 1;
+    mul.lo.u32 %total, %n_heads, %pos1;
+    setp.ge.u32 %p0, %w, %total;
+    @%p0 bra $L_as2_done;
+
+    div.u32 %head, %w, %pos1;
+    rem.u32 %p, %w, %pos1;
+    div.u32 %group, %n_heads, %kv_heads;
+    div.u32 %kv_head, %head, %group;
+
+    ld.param.u64 %q_ptr, [q_ptr];
+    ld.param.u64 %k_ptr, [k_ptr];
+
+    mul.lo.u32 %q_off, %head, %head_dim;
+    mad.lo.u32 %q_off, %head, %head_dim, %lane;
+    mul.wide.u32 %q_a, %q_off, 4;
+    add.u64 %q_a, %q_ptr, %q_a;
+
+    mad.lo.u32 %k_off, %p, %kv_heads, %kv_head;
+    mad.lo.u32 %k_off, %k_off, %head_dim, %lane;
+    mul.wide.u32 %k_a, %k_off, 4;
+    add.u64 %k_a, %k_ptr, %k_a;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %d, %lane;
+$L_as2_dot:
+    setp.ge.u32 %p0, %d, %head_dim;
+    @%p0 bra $L_as2_reduce;
+    ld.global.f32 %qv, [%q_a];
+    ld.global.f32 %kv, [%k_a];
+    fma.rn.f32 %sum, %qv, %kv, %sum;
+    add.u64 %q_a, %q_a, 128;
+    add.u64 %k_a, %k_a, 128;
+    add.u32 %d, %d, 32;
+    bra $L_as2_dot;
+
+$L_as2_reduce:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    ld.param.f32 %scale, [scale];
+    mul.f32 %sc, %sum, %scale;
+
+    mad.lo.u32 %s_off, %head, %max_ctx, %p;
+    mul.wide.u32 %s_a, %s_off, 4;
+    ld.param.u64 %scores_ptr, [scores_ptr];
+    add.u64 %s_a, %scores_ptr, %s_a;
+    setp.ne.u32 %p1, %lane, 0;
+    @%p1 bra $L_as2_done;
+    st.global.f32 [%s_a], %sc;
+$L_as2_done:
+    ret;
+}
+
+// Attention weighted sum: one warp per head.
+// context[head][dim] = sum_p softmax(scores[head][p]) * v[p][kv_head][dim]
+.visible .entry attn_weighted_f32(
+    .param .u64 out_ptr,
+    .param .u64 v_ptr,
+    .param .u64 scores_ptr,
+    .param .u64 pos_ptr,
+    .param .u32 max_ctx,
+    .param .u32 n_heads,
+    .param .u32 kv_heads,
+    .param .u32 head_dim
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %lane, %warp_id, %w, %t0, %head, %p, %group, %kv_head, %d, %pos, %max_ctx;
+    .reg .b32 %n_heads, %kv_heads, %head_dim, %v_off;
+    .reg .b64 %out_ptr, %v_ptr, %scores_ptr, %s_base, %s_a, %v_a, %o_a, %pos_ptr;
+    .reg .f32 %sc, %mx, %sum, %inv, %wgt, %vv, %acc, %e, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mad.lo.u32 %w, %t0, 4, %warp_id;
+
+    ld.param.u32 %n_heads, [n_heads];
+    setp.ge.u32 %p0, %w, %n_heads;
+    @%p0 ret;
+    mov.u32 %head, %w;
+
+    ld.param.u32 %kv_heads, [kv_heads];
+    div.u32 %group, %n_heads, %kv_heads;
+    div.u32 %kv_head, %head, %group;
+
+    ld.param.u32 %max_ctx, [max_ctx];
+    ld.param.u64 %scores_ptr, [scores_ptr];
+    mad.lo.u32 %v_off, %head, %max_ctx, 0;
+    mul.wide.u32 %s_base, %v_off, 4;
+    add.u64 %s_base, %scores_ptr, %s_base;
+
+    ld.param.u64 %pos_ptr, [pos_ptr];
+    ld.global.u32 %pos, [%pos_ptr];
+
+    // pass 1: max over scores
+    mov.f32 %mx, 0fFF800000;
+    mov.u32 %p, %lane;
+    mul.wide.u32 %s_a, %lane, 4;
+    add.u64 %s_a, %s_base, %s_a;
+$L_aw_max:
+    setp.gt.u32 %p0, %p, %pos;
+    @%p0 bra $L_aw_max_reduce;
+    ld.global.f32 %sc, [%s_a];
+    max.f32 %mx, %mx, %sc;
+    add.u64 %s_a, %s_a, 128;
+    add.u32 %p, %p, 32;
+    bra $L_aw_max;
+$L_aw_max_reduce:
+    shfl.sync.down.b32 %shfl_tmp, %mx, 16, 0x1f, 0xffffffff;
+    max.f32 %mx, %mx, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %mx, 8, 0x1f, 0xffffffff;
+    max.f32 %mx, %mx, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %mx, 4, 0x1f, 0xffffffff;
+    max.f32 %mx, %mx, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %mx, 2, 0x1f, 0xffffffff;
+    max.f32 %mx, %mx, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %mx, 1, 0x1f, 0xffffffff;
+    max.f32 %mx, %mx, %shfl_tmp;
+    shfl.sync.idx.b32 %shfl_tmp, %mx, 0, 0x1f, 0xffffffff;
+    mov.f32 %mx, %shfl_tmp;
+
+    // pass 2: sum of exp(score - max)
+    mov.f32 %sum, 0.0;
+    mov.u32 %p, %lane;
+    mul.wide.u32 %s_a, %lane, 4;
+    add.u64 %s_a, %s_base, %s_a;
+$L_aw_sum:
+    setp.gt.u32 %p0, %p, %pos;
+    @%p0 bra $L_aw_sum_reduce;
+    ld.global.f32 %sc, [%s_a];
+    sub.f32 %sc, %sc, %mx;
+    mul.f32 %sc, %sc, 0f3FB8AA3B;   // * log2(e)
+    ex2.approx.f32 %e, %sc;
+    add.f32 %sum, %sum, %e;
+    add.u64 %s_a, %s_a, 128;
+    add.u32 %p, %p, 32;
+    bra $L_aw_sum;
+$L_aw_sum_reduce:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.idx.b32 %shfl_tmp, %sum, 0, 0x1f, 0xffffffff;
+    mov.f32 %sum, %shfl_tmp;
+    rcp.approx.f32 %inv, %sum;
+
+    // pass 3: weighted sum of V
+    ld.param.u32 %head_dim, [head_dim];
+    ld.param.u64 %v_ptr, [v_ptr];
+    ld.param.u64 %out_ptr, [out_ptr];
+
+    mov.u32 %d, %lane;
+$L_aw_dims:
+    setp.ge.u32 %p0, %d, %head_dim;
+    @%p0 bra $L_aw_next_dim;
+    mov.f32 %acc, 0.0;
+    mov.u32 %p, 0;
+$L_aw_p:
+    setp.gt.u32 %p0, %p, %pos;
+    @%p0 bra $L_aw_store;
+    mul.wide.u32 %s_a, %p, 4;
+    add.u64 %s_a, %s_base, %s_a;
+    ld.global.f32 %sc, [%s_a];
+    sub.f32 %sc, %sc, %mx;
+    mul.f32 %sc, %sc, 0f3FB8AA3B;
+    ex2.approx.f32 %e, %sc;
+    mul.f32 %wgt, %e, %inv;
+    mad.lo.u32 %v_off, %p, %kv_heads, %kv_head;
+    mul.lo.u32 %v_off, %v_off, %head_dim;
+    add.u32 %v_off, %v_off, %d;
+    mul.wide.u32 %v_a, %v_off, 4;
+    add.u64 %v_a, %v_ptr, %v_a;
+    ld.global.f32 %vv, [%v_a];
+    fma.rn.f32 %acc, %wgt, %vv, %acc;
+    add.u32 %p, %p, 1;
+    bra $L_aw_p;
+$L_aw_store:
+    mad.lo.u32 %v_off, %head, %head_dim, %d;
+    mul.wide.u32 %o_a, %v_off, 4;
+    add.u64 %o_a, %out_ptr, %o_a;
+    st.global.f32 [%o_a], %acc;
+    add.u32 %d, %d, 32;
+    bra $L_aw_dims;
+$L_aw_next_dim:
+    ret;
+}
+
+// Keepalive: runs for the lifetime of the process on a non-blocking stream so
+// the GPU is continuously busy and clocks stay boosted (token generation is
+// otherwise a stream of short bursts that lets the driver park the clocks at
+// ~210 MHz). Mostly burns ALU cycles; polls the host-mapped stop flag only
+// every few microseconds so zero-copy reads don't flood PCIe. Host writes 0
+// to release.
+.visible .entry keepalive(
+    .param .u64 flag_ptr
+)
+{
+    .reg .pred %p<2>;
+    .reg .b64 %flag_ptr;
+    .reg .b32 %v, %k;
+
+    ld.param.u64 %flag_ptr, [flag_ptr];
+$L_spin:
+    mov.u32 %k, 0;
+$L_burn:
+    add.u32 %k, %k, 1;
+    setp.lt.u32 %p1, %k, 4096;
+    @%p1 bra $L_burn;
+    ld.volatile.global.u32 %v, [%flag_ptr];
+    setp.ne.u32 %p0, %v, 0;
+    @%p0 bra $L_spin;
+    ret;
+}
+
+
+// ===========================================================================
+// Vectorized Q8_0 GEMV (v2): one warp per row, each lane loads one u32
+// (4 int8 weights) + one f32 activation per iteration. A warp covers 128
+// columns per iteration. Requires cols % 128 == 0.
+// Compact group layout: [4 x u16 scale][128 x i8]. Lane L reads scale L>>3
+// and four weights at 8 + (L>>3)*32 + (L&7)*4.
+// ===========================================================================
+.visible .entry gemv_q8_0_v2(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p<3>;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_groups, %g;
+    .reg .b32 %t0, %t1, %sb, %ib, %off_w, %off_s, %off_x, %w32, %e;
+    .reg .b64 %w_ptr, %in_ptr, %out_ptr, %row_offset, %gaddr, %addr, %goff, %row_64;
+    .reg .b64 %lane_wb, %lane_sb, %lane_xb, %lane_offset;
+    .reg .f32 %scale, %f0, %f1, %f2, %f3, %x0, %x1, %x2, %x3, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %w_ptr, [weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %sb, %lane, 3;
+    and.b32 %ib, %lane, 7;
+
+    shl.b32 %off_s, %sb, 1;
+    shl.b32 %t0, %sb, 5;
+    shl.b32 %t1, %ib, 2;
+    add.u32 %off_w, %t0, %t1;
+    add.u32 %off_w, %off_w, 8;
+    shl.b32 %off_x, %ib, 4;
+    shl.b32 %t1, %sb, 7;
+    add.u32 %off_x, %off_x, %t1;
+
+    cvt.u64.u32 %lane_wb, %off_w;
+    cvt.u64.u32 %lane_sb, %off_s;
+    cvt.u64.u32 %lane_xb, %off_x;
+
+    shr.u32 %num_groups, %cols, 7;
+
+    cvt.u64.u32 %row_64, %row;
+    mul.wide.u32 %row_offset, %num_groups, 136;
+    mul.lo.u64 %row_offset, %row_offset, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_offset;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %g, 0;
+
+$L_loop_v2:
+    setp.ge.u32 %p1, %g, %num_groups;
+    @%p1 bra $L_reduce_v2;
+
+    mul.wide.u32 %goff, %g, 136;
+    add.u64 %gaddr, %w_ptr, %goff;
+
+    add.u64 %addr, %gaddr, %lane_sb;
+    ld.global.cs.u16 %h0, [%addr];
+    cvt.f32.f16 %scale, %h0;
+
+    add.u64 %addr, %gaddr, %lane_wb;
+    ld.global.cs.u32 %w32, [%addr];
+
+    mul.wide.u32 %goff, %g, 512;
+    add.u64 %addr, %in_ptr, %goff;
+    add.u64 %addr, %addr, %lane_xb;
+    ld.global.v4.f32 {%x0, %x1, %x2, %x3}, [%addr];
+
+    shl.b32 %e, %w32, 24;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f0, %e;
+    shl.b32 %e, %w32, 16;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f1, %e;
+    shl.b32 %e, %w32, 8;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f2, %e;
+    shr.s32 %e, %w32, 24;
+    cvt.rn.f32.s32 %f3, %e;
+
+    mul.f32 %f0, %f0, %scale;
+    fma.rn.f32 %sum, %f0, %x0, %sum;
+    mul.f32 %f1, %f1, %scale;
+    fma.rn.f32 %sum, %f1, %x1, %sum;
+    mul.f32 %f2, %f2, %scale;
+    fma.rn.f32 %sum, %f2, %x2, %sum;
+    mul.f32 %f3, %f3, %scale;
+    fma.rn.f32 %sum, %f3, %x3, %sum;
+
+    add.u32 %g, %g, 1;
+    bra $L_loop_v2;
+
+$L_reduce_v2:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @%p2 mul.wide.u32 %lane_offset, %row, 4;
+    @%p2 add.u64 %lane_offset, %out_ptr, %lane_offset;
+    @%p2 st.global.f32 [%lane_offset], %sum;
+
+    ret;
+}
+
+// ===========================================================================
+// Fused QKV vectorized: same 128-col grouping, one warp per output row.
+// Rows are concatenated Q | K | V matrices with identical cols.
+// ===========================================================================
+.visible .entry gemv_fused_qkv_q8_0_v2(
+    .param .u64 q_weights_ptr,
+    .param .u64 k_weights_ptr,
+    .param .u64 v_weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_qkv_ptr,
+    .param .u32 cols,
+    .param .u32 q_rows,
+    .param .u32 k_rows,
+    .param .u32 v_rows
+)
+{
+    .reg .pred %p_valid, %p_is_q, %p_is_k, %p1, %p2;
+    .reg .b16 %h0;
+    .reg .b32 %lane, %warp_id, %global_row, %cols, %q_rows, %k_rows, %v_rows;
+    .reg .b32 %total_rows, %num_groups, %g, %t0, %t1, %sb, %ib;
+    .reg .b32 %off_w, %off_s, %off_x, %w32, %e, %local_row, %k_limit;
+    .reg .b64 %q_ptr, %k_ptr, %v_ptr, %w_ptr, %in_ptr, %out_ptr, %row_offset;
+    .reg .b64 %gaddr, %addr, %goff, %row_64, %lane_wb, %lane_sb, %lane_xb, %lane_offset;
+    .reg .f32 %scale, %f0, %f1, %f2, %f3, %x0, %x1, %x2, %x3, %sum, %shfl_tmp;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %global_row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %q_rows, [q_rows];
+    ld.param.u32 %k_rows, [k_rows];
+    ld.param.u32 %v_rows, [v_rows];
+
+    add.u32 %k_limit, %q_rows, %k_rows;
+    add.u32 %total_rows, %k_limit, %v_rows;
+
+    setp.lt.u32 %p_valid, %global_row, %total_rows;
+    @!%p_valid ret;
+
+    ld.param.u64 %q_ptr, [q_weights_ptr];
+    ld.param.u64 %k_ptr, [k_weights_ptr];
+    ld.param.u64 %v_ptr, [v_weights_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_qkv_ptr];
+    ld.param.u32 %cols, [cols];
+
+    setp.lt.u32 %p_is_q, %global_row, %q_rows;
+    @%p_is_q mov.u64 %w_ptr, %q_ptr;
+    @%p_is_q mov.u32 %local_row, %global_row;
+    @%p_is_q bra $L_got_row_v2;
+
+    setp.lt.u32 %p_is_k, %global_row, %k_limit;
+    @%p_is_k mov.u64 %w_ptr, %k_ptr;
+    @%p_is_k sub.u32 %local_row, %global_row, %q_rows;
+    @%p_is_k bra $L_got_row_v2;
+
+    mov.u64 %w_ptr, %v_ptr;
+    sub.u32 %local_row, %global_row, %k_limit;
+
+$L_got_row_v2:
+    shr.u32 %sb, %lane, 3;
+    and.b32 %ib, %lane, 7;
+
+    shl.b32 %off_s, %sb, 1;
+    shl.b32 %t0, %sb, 5;
+    shl.b32 %t1, %ib, 2;
+    add.u32 %off_w, %t0, %t1;
+    add.u32 %off_w, %off_w, 8;
+    shl.b32 %off_x, %ib, 4;
+    shl.b32 %t1, %sb, 7;
+    add.u32 %off_x, %off_x, %t1;
+
+    cvt.u64.u32 %lane_wb, %off_w;
+    cvt.u64.u32 %lane_sb, %off_s;
+    cvt.u64.u32 %lane_xb, %off_x;
+
+    shr.u32 %num_groups, %cols, 7;
+    mul.wide.u32 %row_offset, %num_groups, 136;
+
+    cvt.u64.u32 %row_64, %local_row;
+    mul.lo.u64 %row_offset, %row_offset, %row_64;
+    add.u64 %w_ptr, %w_ptr, %row_offset;
+
+    mov.f32 %sum, 0.0;
+    mov.u32 %g, 0;
+
+$L_loop_qkv_v2:
+    setp.ge.u32 %p1, %g, %num_groups;
+    @%p1 bra $L_reduce_qkv_v2;
+
+    mul.wide.u32 %goff, %g, 136;
+    add.u64 %gaddr, %w_ptr, %goff;
+
+    add.u64 %addr, %gaddr, %lane_sb;
+    ld.global.cs.u16 %h0, [%addr];
+    cvt.f32.f16 %scale, %h0;
+
+    add.u64 %addr, %gaddr, %lane_wb;
+    ld.global.cs.u32 %w32, [%addr];
+
+    mul.wide.u32 %goff, %g, 512;
+    add.u64 %addr, %in_ptr, %goff;
+    add.u64 %addr, %addr, %lane_xb;
+    ld.global.v4.f32 {%x0, %x1, %x2, %x3}, [%addr];
+
+    shl.b32 %e, %w32, 24;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f0, %e;
+    shl.b32 %e, %w32, 16;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f1, %e;
+    shl.b32 %e, %w32, 8;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f2, %e;
+    shr.s32 %e, %w32, 24;
+    cvt.rn.f32.s32 %f3, %e;
+
+    mul.f32 %f0, %f0, %scale;
+    fma.rn.f32 %sum, %f0, %x0, %sum;
+    mul.f32 %f1, %f1, %scale;
+    fma.rn.f32 %sum, %f1, %x1, %sum;
+    mul.f32 %f2, %f2, %scale;
+    fma.rn.f32 %sum, %f2, %x2, %sum;
+    mul.f32 %f3, %f3, %scale;
+    fma.rn.f32 %sum, %f3, %x3, %sum;
+
+    add.u32 %g, %g, 1;
+    bra $L_loop_qkv_v2;
+
+$L_reduce_qkv_v2:
+    shfl.sync.down.b32 %shfl_tmp, %sum, 16, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 8, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 4, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 2, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum, 1, 0x1f, 0xffffffff;
+    add.f32 %sum, %sum, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @%p2 mul.wide.u32 %lane_offset, %global_row, 4;
+    @%p2 add.u64 %lane_offset, %out_ptr, %lane_offset;
+    @%p2 st.global.f32 [%lane_offset], %sum;
+
+    ret;
+}
+
+// ===========================================================================
+// Fused FFN (gate+up -> silu(gate)*up) vectorized: 128-col groups.
+// ===========================================================================
+.visible .entry gemv_fused_ffn_q8_0_v2(
+    .param .u64 gate_ptr,
+    .param .u64 up_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p<3>;
+    .reg .b16 %h_g, %h_u;
+    .reg .b32 %lane, %warp_id, %row, %cols, %rows, %num_groups, %g;
+    .reg .b32 %t0, %t1, %sb, %ib, %off_w, %off_s, %off_x, %w_g, %w_u, %e;
+    .reg .b64 %g_ptr, %u_ptr, %in_ptr, %out_ptr, %row_offset, %gaddr, %addr, %lane_offset;
+    .reg .b64 %goff, %row_64, %lane_wb, %lane_sb, %lane_xb;
+    .reg .f32 %scale_g, %scale_u, %f0, %f1, %f2, %f3, %x0, %x1, %x2, %x3;
+    .reg .f32 %sum_g, %sum_u, %shfl_tmp;
+    .reg .f32 %neg_g, %log2_e, %exp_neg_g, %denom, %sig, %silu, %fused;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row, %t0, %t1, %warp_id;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p0, %row, %rows;
+    @%p0 ret;
+
+    ld.param.u64 %g_ptr, [gate_ptr];
+    ld.param.u64 %u_ptr, [up_ptr];
+    ld.param.u64 %in_ptr, [input_ptr];
+    ld.param.u64 %out_ptr, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %sb, %lane, 3;
+    and.b32 %ib, %lane, 7;
+
+    shl.b32 %off_s, %sb, 1;
+    shl.b32 %t0, %sb, 5;
+    shl.b32 %t1, %ib, 2;
+    add.u32 %off_w, %t0, %t1;
+    add.u32 %off_w, %off_w, 8;
+    shl.b32 %off_x, %ib, 4;
+    shl.b32 %t1, %sb, 7;
+    add.u32 %off_x, %off_x, %t1;
+
+    cvt.u64.u32 %lane_wb, %off_w;
+    cvt.u64.u32 %lane_sb, %off_s;
+    cvt.u64.u32 %lane_xb, %off_x;
+
+    shr.u32 %num_groups, %cols, 7;
+
+    cvt.u64.u32 %row_64, %row;
+    mul.wide.u32 %row_offset, %num_groups, 136;
+    mul.lo.u64 %row_offset, %row_offset, %row_64;
+    add.u64 %g_ptr, %g_ptr, %row_offset;
+    add.u64 %u_ptr, %u_ptr, %row_offset;
+
+    mov.f32 %sum_g, 0.0;
+    mov.f32 %sum_u, 0.0;
+    mov.u32 %g, 0;
+
+$L_loop_ffn_v2:
+    setp.ge.u32 %p1, %g, %num_groups;
+    @%p1 bra $L_reduce_ffn_v2;
+
+    mul.wide.u32 %goff, %g, 136;
+    add.u64 %gaddr, %g_ptr, %goff;
+    add.u64 %addr, %u_ptr, %goff;
+
+    add.u64 %gaddr, %gaddr, %lane_sb;
+    ld.global.cs.u16 %h_g, [%gaddr];
+    cvt.f32.f16 %scale_g, %h_g;
+
+    add.u64 %addr, %addr, %lane_sb;
+    ld.global.cs.u16 %h_u, [%addr];
+    cvt.f32.f16 %scale_u, %h_u;
+
+    mul.wide.u32 %goff, %g, 136;
+    add.u64 %gaddr, %g_ptr, %goff;
+    add.u64 %addr, %u_ptr, %goff;
+
+    add.u64 %gaddr, %gaddr, %lane_wb;
+    ld.global.cs.u32 %w_g, [%gaddr];
+    add.u64 %addr, %addr, %lane_wb;
+    ld.global.cs.u32 %w_u, [%addr];
+
+    mul.wide.u32 %goff, %g, 512;
+    add.u64 %addr, %in_ptr, %goff;
+    add.u64 %addr, %addr, %lane_xb;
+    ld.global.v4.f32 {%x0, %x1, %x2, %x3}, [%addr];
+
+    shl.b32 %e, %w_g, 24;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f0, %e;
+    shl.b32 %e, %w_g, 16;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f1, %e;
+    shl.b32 %e, %w_g, 8;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f2, %e;
+    shr.s32 %e, %w_g, 24;
+    cvt.rn.f32.s32 %f3, %e;
+
+    mul.f32 %f0, %f0, %scale_g;
+    fma.rn.f32 %sum_g, %f0, %x0, %sum_g;
+    mul.f32 %f1, %f1, %scale_g;
+    fma.rn.f32 %sum_g, %f1, %x1, %sum_g;
+    mul.f32 %f2, %f2, %scale_g;
+    fma.rn.f32 %sum_g, %f2, %x2, %sum_g;
+    mul.f32 %f3, %f3, %scale_g;
+    fma.rn.f32 %sum_g, %f3, %x3, %sum_g;
+
+    shl.b32 %e, %w_u, 24;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f0, %e;
+    shl.b32 %e, %w_u, 16;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f1, %e;
+    shl.b32 %e, %w_u, 8;
+    shr.s32 %e, %e, 24;
+    cvt.rn.f32.s32 %f2, %e;
+    shr.s32 %e, %w_u, 24;
+    cvt.rn.f32.s32 %f3, %e;
+
+    mul.f32 %f0, %f0, %scale_u;
+    fma.rn.f32 %sum_u, %f0, %x0, %sum_u;
+    mul.f32 %f1, %f1, %scale_u;
+    fma.rn.f32 %sum_u, %f1, %x1, %sum_u;
+    mul.f32 %f2, %f2, %scale_u;
+    fma.rn.f32 %sum_u, %f2, %x2, %sum_u;
+    mul.f32 %f3, %f3, %scale_u;
+    fma.rn.f32 %sum_u, %f3, %x3, %sum_u;
+
+    add.u32 %g, %g, 1;
+    bra $L_loop_ffn_v2;
+
+$L_reduce_ffn_v2:
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 16, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 8, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 4, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 2, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_g, 1, 0x1f, 0xffffffff;
+    add.f32 %sum_g, %sum_g, %shfl_tmp;
+
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 16, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 8, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 4, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 2, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+    shfl.sync.down.b32 %shfl_tmp, %sum_u, 1, 0x1f, 0xffffffff;
+    add.f32 %sum_u, %sum_u, %shfl_tmp;
+
+    setp.eq.u32 %p2, %lane, 0;
+    @!%p2 ret;
+
+    neg.f32 %neg_g, %sum_g;
+    mul.f32 %log2_e, %neg_g, 0f3fb8aa3b;
+    ex2.approx.f32 %exp_neg_g, %log2_e;
+    add.f32 %denom, %exp_neg_g, 0f3f800000;
+    rcp.approx.f32 %sig, %denom;
+    mul.f32 %silu, %sum_g, %sig;
+    mul.f32 %fused, %silu, %sum_u;
+
+    mul.wide.u32 %lane_offset, %row, 4;
+    add.u64 %lane_offset, %out_ptr, %lane_offset;
+    st.global.f32 [%lane_offset], %fused;
+
+    ret;
+}
+
+// ===========================================================================
+// Vectorized Q8_0 GEMV (v3): two output rows per warp. Both rows share the
+// activation load and use independent accumulator chains, exposing more ILP
+// to hide global-memory and FMA latency. Requires cols % 128 == 0 and the same
+// padded 36-byte Q8_0 block layout as v2.
+// ===========================================================================
+.visible .entry gemv_q8_0_v3(
+    .param .u64 weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_row0_bad, %p_row1, %p_loop_done, %p_lane0;
+    .reg .b16 %h0, %h1;
+    .reg .b32 %lane, %warp_id, %row0, %row1, %cols, %rows, %num_groups, %g;
+    .reg .b32 %t0, %t1, %sb, %ib, %off_w, %off_s, %off_x, %w0, %w1, %e0, %e1;
+    .reg .b64 %weights, %input, %output, %row_stride, %row64, %row_offset;
+    .reg .b64 %lane_wb, %lane_sb, %lane_xb, %saddr0, %saddr1, %waddr0, %waddr1, %xaddr;
+    .reg .b64 %out_addr;
+    .reg .f32 %scale0, %scale1, %q0, %q1, %x0, %x1, %x2, %x3;
+    .reg .f32 %sum0, %sum1, %shfl0, %shfl1;
+
+    mov.u32 %lane, %tid.x;
+    mov.u32 %warp_id, %tid.y;
+    mov.u32 %t0, %ctaid.x;
+    mov.u32 %t1, %ntid.y;
+    mad.lo.u32 %row0, %t0, %t1, %warp_id;
+    shl.b32 %row0, %row0, 1;
+
+    ld.param.u32 %rows, [rows];
+    setp.ge.u32 %p_row0_bad, %row0, %rows;
+    @%p_row0_bad ret;
+    add.u32 %row1, %row0, 1;
+    setp.lt.u32 %p_row1, %row1, %rows;
+
+    ld.param.u64 %weights, [weights_ptr];
+    ld.param.u64 %input, [input_ptr];
+    ld.param.u64 %output, [output_ptr];
+    ld.param.u32 %cols, [cols];
+
+    shr.u32 %sb, %lane, 3;
+    and.b32 %ib, %lane, 7;
+    shl.b32 %off_s, %sb, 1;
+    shl.b32 %t0, %sb, 5;
+    shl.b32 %t1, %ib, 2;
+    add.u32 %off_w, %t0, %t1;
+    add.u32 %off_w, %off_w, 8;
+    shl.b32 %off_x, %ib, 4;
+    shl.b32 %t1, %sb, 7;
+    add.u32 %off_x, %off_x, %t1;
+    cvt.u64.u32 %lane_wb, %off_w;
+    cvt.u64.u32 %lane_sb, %off_s;
+    cvt.u64.u32 %lane_xb, %off_x;
+
+    shr.u32 %num_groups, %cols, 7;
+    mul.wide.u32 %row_stride, %num_groups, 136;
+
+    cvt.u64.u32 %row64, %row0;
+    mul.lo.u64 %row_offset, %row_stride, %row64;
+    add.u64 %row_offset, %weights, %row_offset;
+    add.u64 %saddr0, %row_offset, %lane_sb;
+    add.u64 %waddr0, %row_offset, %lane_wb;
+
+    cvt.u64.u32 %row64, %row1;
+    mul.lo.u64 %row_offset, %row_stride, %row64;
+    add.u64 %row_offset, %weights, %row_offset;
+    add.u64 %saddr1, %row_offset, %lane_sb;
+    add.u64 %waddr1, %row_offset, %lane_wb;
+    add.u64 %xaddr, %input, %lane_xb;
+
+    mov.f32 %sum0, 0.0;
+    mov.f32 %sum1, 0.0;
+    mov.u32 %w1, 0;
+    mov.u16 %h1, 0;
+    mov.u32 %g, 0;
+
+$L_loop_v3:
+    setp.ge.u32 %p_loop_done, %g, %num_groups;
+    @%p_loop_done bra $L_reduce_v3;
+
+    ld.global.cs.u16 %h0, [%saddr0];
+    @%p_row1 ld.global.cs.u16 %h1, [%saddr1];
+    ld.global.cs.u32 %w0, [%waddr0];
+    @%p_row1 ld.global.cs.u32 %w1, [%waddr1];
+    ld.global.v4.f32 {%x0, %x1, %x2, %x3}, [%xaddr];
+    cvt.f32.f16 %scale0, %h0;
+    cvt.f32.f16 %scale1, %h1;
+
+    add.u64 %saddr0, %saddr0, 136;
+    add.u64 %saddr1, %saddr1, 136;
+    add.u64 %waddr0, %waddr0, 136;
+    add.u64 %waddr1, %waddr1, 136;
+    add.u64 %xaddr, %xaddr, 512;
+
+    shl.b32 %e0, %w0, 24;
+    shr.s32 %e0, %e0, 24;
+    shl.b32 %e1, %w1, 24;
+    shr.s32 %e1, %e1, 24;
+    cvt.rn.f32.s32 %q0, %e0;
+    cvt.rn.f32.s32 %q1, %e1;
+    mul.f32 %q0, %q0, %scale0;
+    mul.f32 %q1, %q1, %scale1;
+    fma.rn.f32 %sum0, %q0, %x0, %sum0;
+    fma.rn.f32 %sum1, %q1, %x0, %sum1;
+
+    shl.b32 %e0, %w0, 16;
+    shr.s32 %e0, %e0, 24;
+    shl.b32 %e1, %w1, 16;
+    shr.s32 %e1, %e1, 24;
+    cvt.rn.f32.s32 %q0, %e0;
+    cvt.rn.f32.s32 %q1, %e1;
+    mul.f32 %q0, %q0, %scale0;
+    mul.f32 %q1, %q1, %scale1;
+    fma.rn.f32 %sum0, %q0, %x1, %sum0;
+    fma.rn.f32 %sum1, %q1, %x1, %sum1;
+
+    shl.b32 %e0, %w0, 8;
+    shr.s32 %e0, %e0, 24;
+    shl.b32 %e1, %w1, 8;
+    shr.s32 %e1, %e1, 24;
+    cvt.rn.f32.s32 %q0, %e0;
+    cvt.rn.f32.s32 %q1, %e1;
+    mul.f32 %q0, %q0, %scale0;
+    mul.f32 %q1, %q1, %scale1;
+    fma.rn.f32 %sum0, %q0, %x2, %sum0;
+    fma.rn.f32 %sum1, %q1, %x2, %sum1;
+
+    shr.s32 %e0, %w0, 24;
+    shr.s32 %e1, %w1, 24;
+    cvt.rn.f32.s32 %q0, %e0;
+    cvt.rn.f32.s32 %q1, %e1;
+    mul.f32 %q0, %q0, %scale0;
+    mul.f32 %q1, %q1, %scale1;
+    fma.rn.f32 %sum0, %q0, %x3, %sum0;
+    fma.rn.f32 %sum1, %q1, %x3, %sum1;
+
+    add.u32 %g, %g, 1;
+    bra $L_loop_v3;
+
+$L_reduce_v3:
+    shfl.sync.down.b32 %shfl0, %sum0, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shfl1, %sum1, 16, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %shfl0;
+    add.f32 %sum1, %sum1, %shfl1;
+    shfl.sync.down.b32 %shfl0, %sum0, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shfl1, %sum1, 8, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %shfl0;
+    add.f32 %sum1, %sum1, %shfl1;
+    shfl.sync.down.b32 %shfl0, %sum0, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shfl1, %sum1, 4, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %shfl0;
+    add.f32 %sum1, %sum1, %shfl1;
+    shfl.sync.down.b32 %shfl0, %sum0, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shfl1, %sum1, 2, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %shfl0;
+    add.f32 %sum1, %sum1, %shfl1;
+    shfl.sync.down.b32 %shfl0, %sum0, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shfl1, %sum1, 1, 0x1f, 0xffffffff;
+    add.f32 %sum0, %sum0, %shfl0;
+    add.f32 %sum1, %sum1, %shfl1;
+
+    setp.eq.u32 %p_lane0, %lane, 0;
+    @!%p_lane0 ret;
+    mul.wide.u32 %out_addr, %row0, 4;
+    add.u64 %out_addr, %output, %out_addr;
+    st.global.f32 [%out_addr], %sum0;
+    @!%p_row1 ret;
+    add.u64 %out_addr, %out_addr, 4;
+    st.global.f32 [%out_addr], %sum1;
+    ret;
+}
+
+// Fused QKV v3: two concatenated output rows per warp, sharing activations.
+.visible .entry gemv_fused_qkv_q8_0_v3(
+    .param .u64 q_weights_ptr,
+    .param .u64 k_weights_ptr,
+    .param .u64 v_weights_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_qkv_ptr,
+    .param .u32 cols,
+    .param .u32 q_rows,
+    .param .u32 k_rows,
+    .param .u32 v_rows,
+    .param .u64 bias_ptr
+)
+{
+    .reg .pred %p_qv3_bad0, %p_qv3_valid1, %p_qv3_q0, %p_qv3_k0;
+    .reg .pred %p_qv3_q1, %p_qv3_k1, %p_qv3_done, %p_qv3_lane0, %p_qv3_bias;
+    .reg .b16 %qv3_h0, %qv3_h1;
+    .reg .b32 %qv3_lane, %qv3_warp, %qv3_row0, %qv3_row1, %qv3_local0, %qv3_local1;
+    .reg .b32 %qv3_cols, %qv3_qrows, %qv3_krows, %qv3_vrows, %qv3_klimit, %qv3_total;
+    .reg .b32 %qv3_groups, %qv3_g, %qv3_t0, %qv3_t1, %qv3_sb, %qv3_ib;
+    .reg .b32 %qv3_offw, %qv3_offs, %qv3_offx, %qv3_w0, %qv3_w1, %qv3_e0, %qv3_e1;
+    .reg .b64 %qv3_q, %qv3_k, %qv3_v, %qv3_base0, %qv3_base1, %qv3_input, %qv3_output, %qv3_bias;
+    .reg .b64 %qv3_stride, %qv3_row64, %qv3_roff, %qv3_lanew, %qv3_lanes, %qv3_lanex;
+    .reg .b64 %qv3_saddr0, %qv3_saddr1, %qv3_waddr0, %qv3_waddr1, %qv3_xaddr, %qv3_outaddr;
+    .reg .f32 %qv3_scale0, %qv3_scale1, %qv3_f0, %qv3_f1, %qv3_b;
+    .reg .f32 %qv3_x0, %qv3_x1, %qv3_x2, %qv3_x3, %qv3_sum0, %qv3_sum1, %qv3_sh0, %qv3_sh1;
+
+    mov.u32 %qv3_lane, %tid.x;
+    mov.u32 %qv3_warp, %tid.y;
+    mov.u32 %qv3_t0, %ctaid.x;
+    mov.u32 %qv3_t1, %ntid.y;
+    mad.lo.u32 %qv3_row0, %qv3_t0, %qv3_t1, %qv3_warp;
+    shl.b32 %qv3_row0, %qv3_row0, 1;
+
+    ld.param.u32 %qv3_qrows, [q_rows];
+    ld.param.u32 %qv3_krows, [k_rows];
+    ld.param.u32 %qv3_vrows, [v_rows];
+    add.u32 %qv3_klimit, %qv3_qrows, %qv3_krows;
+    add.u32 %qv3_total, %qv3_klimit, %qv3_vrows;
+    setp.ge.u32 %p_qv3_bad0, %qv3_row0, %qv3_total;
+    @%p_qv3_bad0 ret;
+    add.u32 %qv3_row1, %qv3_row0, 1;
+    setp.lt.u32 %p_qv3_valid1, %qv3_row1, %qv3_total;
+
+    ld.param.u64 %qv3_q, [q_weights_ptr];
+    ld.param.u64 %qv3_k, [k_weights_ptr];
+    ld.param.u64 %qv3_v, [v_weights_ptr];
+    ld.param.u64 %qv3_input, [input_ptr];
+    ld.param.u64 %qv3_output, [output_qkv_ptr];
+    ld.param.u64 %qv3_bias, [bias_ptr];
+    ld.param.u32 %qv3_cols, [cols];
+
+    setp.lt.u32 %p_qv3_q0, %qv3_row0, %qv3_qrows;
+    @%p_qv3_q0 mov.u64 %qv3_base0, %qv3_q;
+    @%p_qv3_q0 mov.u32 %qv3_local0, %qv3_row0;
+    @%p_qv3_q0 bra $L_qv3_got0;
+    setp.lt.u32 %p_qv3_k0, %qv3_row0, %qv3_klimit;
+    @%p_qv3_k0 mov.u64 %qv3_base0, %qv3_k;
+    @%p_qv3_k0 sub.u32 %qv3_local0, %qv3_row0, %qv3_qrows;
+    @%p_qv3_k0 bra $L_qv3_got0;
+    mov.u64 %qv3_base0, %qv3_v;
+    sub.u32 %qv3_local0, %qv3_row0, %qv3_klimit;
+$L_qv3_got0:
+
+    mov.u64 %qv3_base1, %qv3_q;
+    mov.u32 %qv3_local1, 0;
+    @!%p_qv3_valid1 bra $L_qv3_got1;
+    setp.lt.u32 %p_qv3_q1, %qv3_row1, %qv3_qrows;
+    @%p_qv3_q1 mov.u64 %qv3_base1, %qv3_q;
+    @%p_qv3_q1 mov.u32 %qv3_local1, %qv3_row1;
+    @%p_qv3_q1 bra $L_qv3_got1;
+    setp.lt.u32 %p_qv3_k1, %qv3_row1, %qv3_klimit;
+    @%p_qv3_k1 mov.u64 %qv3_base1, %qv3_k;
+    @%p_qv3_k1 sub.u32 %qv3_local1, %qv3_row1, %qv3_qrows;
+    @%p_qv3_k1 bra $L_qv3_got1;
+    mov.u64 %qv3_base1, %qv3_v;
+    sub.u32 %qv3_local1, %qv3_row1, %qv3_klimit;
+$L_qv3_got1:
+
+    shr.u32 %qv3_sb, %qv3_lane, 3;
+    and.b32 %qv3_ib, %qv3_lane, 7;
+    shl.b32 %qv3_offs, %qv3_sb, 1;
+    shl.b32 %qv3_t0, %qv3_sb, 5;
+    shl.b32 %qv3_t1, %qv3_ib, 2;
+    add.u32 %qv3_offw, %qv3_t0, %qv3_t1;
+    add.u32 %qv3_offw, %qv3_offw, 8;
+    shl.b32 %qv3_offx, %qv3_ib, 4;
+    shl.b32 %qv3_t1, %qv3_sb, 7;
+    add.u32 %qv3_offx, %qv3_offx, %qv3_t1;
+    cvt.u64.u32 %qv3_lanew, %qv3_offw;
+    cvt.u64.u32 %qv3_lanes, %qv3_offs;
+    cvt.u64.u32 %qv3_lanex, %qv3_offx;
+
+    shr.u32 %qv3_groups, %qv3_cols, 7;
+    mul.wide.u32 %qv3_stride, %qv3_groups, 136;
+    cvt.u64.u32 %qv3_row64, %qv3_local0;
+    mul.lo.u64 %qv3_roff, %qv3_stride, %qv3_row64;
+    add.u64 %qv3_roff, %qv3_base0, %qv3_roff;
+    add.u64 %qv3_saddr0, %qv3_roff, %qv3_lanes;
+    add.u64 %qv3_waddr0, %qv3_roff, %qv3_lanew;
+    cvt.u64.u32 %qv3_row64, %qv3_local1;
+    mul.lo.u64 %qv3_roff, %qv3_stride, %qv3_row64;
+    add.u64 %qv3_roff, %qv3_base1, %qv3_roff;
+    add.u64 %qv3_saddr1, %qv3_roff, %qv3_lanes;
+    add.u64 %qv3_waddr1, %qv3_roff, %qv3_lanew;
+    add.u64 %qv3_xaddr, %qv3_input, %qv3_lanex;
+
+    mov.f32 %qv3_sum0, 0.0;
+    mov.f32 %qv3_sum1, 0.0;
+    mov.u16 %qv3_h1, 0;
+    mov.u32 %qv3_w1, 0;
+    mov.u32 %qv3_g, 0;
+$L_qv3_loop:
+    setp.ge.u32 %p_qv3_done, %qv3_g, %qv3_groups;
+    @%p_qv3_done bra $L_qv3_reduce;
+    ld.global.cs.u16 %qv3_h0, [%qv3_saddr0];
+    @%p_qv3_valid1 ld.global.cs.u16 %qv3_h1, [%qv3_saddr1];
+    ld.global.cs.u32 %qv3_w0, [%qv3_waddr0];
+    @%p_qv3_valid1 ld.global.cs.u32 %qv3_w1, [%qv3_waddr1];
+    ld.global.v4.f32 {%qv3_x0, %qv3_x1, %qv3_x2, %qv3_x3}, [%qv3_xaddr];
+    cvt.f32.f16 %qv3_scale0, %qv3_h0;
+    cvt.f32.f16 %qv3_scale1, %qv3_h1;
+    add.u64 %qv3_saddr0, %qv3_saddr0, 136;
+    add.u64 %qv3_saddr1, %qv3_saddr1, 136;
+    add.u64 %qv3_waddr0, %qv3_waddr0, 136;
+    add.u64 %qv3_waddr1, %qv3_waddr1, 136;
+    add.u64 %qv3_xaddr, %qv3_xaddr, 512;
+
+    shl.b32 %qv3_e0, %qv3_w0, 24;
+    shr.s32 %qv3_e0, %qv3_e0, 24;
+    shl.b32 %qv3_e1, %qv3_w1, 24;
+    shr.s32 %qv3_e1, %qv3_e1, 24;
+    cvt.rn.f32.s32 %qv3_f0, %qv3_e0;
+    cvt.rn.f32.s32 %qv3_f1, %qv3_e1;
+    mul.f32 %qv3_f0, %qv3_f0, %qv3_scale0;
+    mul.f32 %qv3_f1, %qv3_f1, %qv3_scale1;
+    fma.rn.f32 %qv3_sum0, %qv3_f0, %qv3_x0, %qv3_sum0;
+    fma.rn.f32 %qv3_sum1, %qv3_f1, %qv3_x0, %qv3_sum1;
+    shl.b32 %qv3_e0, %qv3_w0, 16;
+    shr.s32 %qv3_e0, %qv3_e0, 24;
+    shl.b32 %qv3_e1, %qv3_w1, 16;
+    shr.s32 %qv3_e1, %qv3_e1, 24;
+    cvt.rn.f32.s32 %qv3_f0, %qv3_e0;
+    cvt.rn.f32.s32 %qv3_f1, %qv3_e1;
+    mul.f32 %qv3_f0, %qv3_f0, %qv3_scale0;
+    mul.f32 %qv3_f1, %qv3_f1, %qv3_scale1;
+    fma.rn.f32 %qv3_sum0, %qv3_f0, %qv3_x1, %qv3_sum0;
+    fma.rn.f32 %qv3_sum1, %qv3_f1, %qv3_x1, %qv3_sum1;
+    shl.b32 %qv3_e0, %qv3_w0, 8;
+    shr.s32 %qv3_e0, %qv3_e0, 24;
+    shl.b32 %qv3_e1, %qv3_w1, 8;
+    shr.s32 %qv3_e1, %qv3_e1, 24;
+    cvt.rn.f32.s32 %qv3_f0, %qv3_e0;
+    cvt.rn.f32.s32 %qv3_f1, %qv3_e1;
+    mul.f32 %qv3_f0, %qv3_f0, %qv3_scale0;
+    mul.f32 %qv3_f1, %qv3_f1, %qv3_scale1;
+    fma.rn.f32 %qv3_sum0, %qv3_f0, %qv3_x2, %qv3_sum0;
+    fma.rn.f32 %qv3_sum1, %qv3_f1, %qv3_x2, %qv3_sum1;
+    shr.s32 %qv3_e0, %qv3_w0, 24;
+    shr.s32 %qv3_e1, %qv3_w1, 24;
+    cvt.rn.f32.s32 %qv3_f0, %qv3_e0;
+    cvt.rn.f32.s32 %qv3_f1, %qv3_e1;
+    mul.f32 %qv3_f0, %qv3_f0, %qv3_scale0;
+    mul.f32 %qv3_f1, %qv3_f1, %qv3_scale1;
+    fma.rn.f32 %qv3_sum0, %qv3_f0, %qv3_x3, %qv3_sum0;
+    fma.rn.f32 %qv3_sum1, %qv3_f1, %qv3_x3, %qv3_sum1;
+    add.u32 %qv3_g, %qv3_g, 1;
+    bra $L_qv3_loop;
+
+$L_qv3_reduce:
+    shfl.sync.down.b32 %qv3_sh0, %qv3_sum0, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %qv3_sh1, %qv3_sum1, 16, 0x1f, 0xffffffff;
+    add.f32 %qv3_sum0, %qv3_sum0, %qv3_sh0;
+    add.f32 %qv3_sum1, %qv3_sum1, %qv3_sh1;
+    shfl.sync.down.b32 %qv3_sh0, %qv3_sum0, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %qv3_sh1, %qv3_sum1, 8, 0x1f, 0xffffffff;
+    add.f32 %qv3_sum0, %qv3_sum0, %qv3_sh0;
+    add.f32 %qv3_sum1, %qv3_sum1, %qv3_sh1;
+    shfl.sync.down.b32 %qv3_sh0, %qv3_sum0, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %qv3_sh1, %qv3_sum1, 4, 0x1f, 0xffffffff;
+    add.f32 %qv3_sum0, %qv3_sum0, %qv3_sh0;
+    add.f32 %qv3_sum1, %qv3_sum1, %qv3_sh1;
+    shfl.sync.down.b32 %qv3_sh0, %qv3_sum0, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %qv3_sh1, %qv3_sum1, 2, 0x1f, 0xffffffff;
+    add.f32 %qv3_sum0, %qv3_sum0, %qv3_sh0;
+    add.f32 %qv3_sum1, %qv3_sum1, %qv3_sh1;
+    shfl.sync.down.b32 %qv3_sh0, %qv3_sum0, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %qv3_sh1, %qv3_sum1, 1, 0x1f, 0xffffffff;
+    add.f32 %qv3_sum0, %qv3_sum0, %qv3_sh0;
+    add.f32 %qv3_sum1, %qv3_sum1, %qv3_sh1;
+    setp.eq.u32 %p_qv3_lane0, %qv3_lane, 0;
+    @!%p_qv3_lane0 ret;
+    mul.wide.u32 %qv3_outaddr, %qv3_row0, 4;
+    setp.ne.u64 %p_qv3_bias, %qv3_bias, 0;
+    @%p_qv3_bias add.u64 %qv3_roff, %qv3_bias, %qv3_outaddr;
+    @%p_qv3_bias ld.global.f32 %qv3_b, [%qv3_roff];
+    @%p_qv3_bias add.f32 %qv3_sum0, %qv3_sum0, %qv3_b;
+    add.u64 %qv3_outaddr, %qv3_output, %qv3_outaddr;
+    st.global.f32 [%qv3_outaddr], %qv3_sum0;
+    @!%p_qv3_valid1 ret;
+    add.u64 %qv3_outaddr, %qv3_outaddr, 4;
+    @%p_qv3_bias add.u64 %qv3_roff, %qv3_bias, %qv3_outaddr;
+    // outaddr is output-relative here; recover the row-relative bias address.
+    @%p_qv3_bias sub.u64 %qv3_roff, %qv3_roff, %qv3_output;
+    @%p_qv3_bias ld.global.f32 %qv3_b, [%qv3_roff];
+    @%p_qv3_bias add.f32 %qv3_sum1, %qv3_sum1, %qv3_b;
+    st.global.f32 [%qv3_outaddr], %qv3_sum1;
+    ret;
+}
+
+// ===========================================================================
+// Fused Q8_0 FFN (v3): two output rows per warp. Four independent dot-product
+// chains (gate/up for both rows) share one activation vector load.
+// ===========================================================================
+.visible .entry gemv_fused_ffn_q8_0_v3(
+    .param .u64 gate_ptr,
+    .param .u64 up_ptr,
+    .param .u64 input_ptr,
+    .param .u64 output_ptr,
+    .param .u32 cols,
+    .param .u32 rows
+)
+{
+    .reg .pred %p_ff3_row0_bad, %p_ff3_row1, %p_ff3_done, %p_ff3_lane0;
+    .reg .b16 %hg0, %hu0, %hg1, %hu1;
+    .reg .b32 %ff3_lane, %ff3_warp, %ff3_row0, %ff3_row1, %ff3_cols, %ff3_rows;
+    .reg .b32 %ff3_groups, %ff3_g, %ff3_t0, %ff3_t1, %ff3_sb, %ff3_ib;
+    .reg .b32 %ff3_offw, %ff3_offs, %ff3_offx, %wg0, %wu0, %wg1, %wu1;
+    .reg .b32 %eg0, %eu0, %eg1, %eu1;
+    .reg .b64 %ff3_gate, %ff3_up, %ff3_input, %ff3_output, %ff3_stride;
+    .reg .b64 %ff3_row64, %ff3_roff, %ff3_lanew, %ff3_lanes, %ff3_lanex;
+    .reg .b64 %sg_addr0, %su_addr0, %wg_addr0, %wu_addr0;
+    .reg .b64 %sg_addr1, %su_addr1, %wg_addr1, %wu_addr1, %ff3_xaddr, %ff3_outaddr;
+    .reg .f32 %sg0, %su0, %sg1, %su1, %qg0, %qu0, %qg1, %qu1;
+    .reg .f32 %ff3_x0, %ff3_x1, %ff3_x2, %ff3_x3;
+    .reg .f32 %sumg0, %sumu0, %sumg1, %sumu1;
+    .reg .f32 %shg0, %shu0, %shg1, %shu1;
+    .reg .f32 %ff3_neg, %ff3_log2e, %ff3_exp, %ff3_denom, %ff3_sig, %ff3_silu, %ff3_fused;
+
+    mov.u32 %ff3_lane, %tid.x;
+    mov.u32 %ff3_warp, %tid.y;
+    mov.u32 %ff3_t0, %ctaid.x;
+    mov.u32 %ff3_t1, %ntid.y;
+    mad.lo.u32 %ff3_row0, %ff3_t0, %ff3_t1, %ff3_warp;
+    shl.b32 %ff3_row0, %ff3_row0, 1;
+
+    ld.param.u32 %ff3_rows, [rows];
+    setp.ge.u32 %p_ff3_row0_bad, %ff3_row0, %ff3_rows;
+    @%p_ff3_row0_bad ret;
+    add.u32 %ff3_row1, %ff3_row0, 1;
+    setp.lt.u32 %p_ff3_row1, %ff3_row1, %ff3_rows;
+
+    ld.param.u64 %ff3_gate, [gate_ptr];
+    ld.param.u64 %ff3_up, [up_ptr];
+    ld.param.u64 %ff3_input, [input_ptr];
+    ld.param.u64 %ff3_output, [output_ptr];
+    ld.param.u32 %ff3_cols, [cols];
+
+    shr.u32 %ff3_sb, %ff3_lane, 3;
+    and.b32 %ff3_ib, %ff3_lane, 7;
+    shl.b32 %ff3_offs, %ff3_sb, 1;
+    shl.b32 %ff3_t0, %ff3_sb, 5;
+    shl.b32 %ff3_t1, %ff3_ib, 2;
+    add.u32 %ff3_offw, %ff3_t0, %ff3_t1;
+    add.u32 %ff3_offw, %ff3_offw, 8;
+    shl.b32 %ff3_offx, %ff3_ib, 4;
+    shl.b32 %ff3_t1, %ff3_sb, 7;
+    add.u32 %ff3_offx, %ff3_offx, %ff3_t1;
+    cvt.u64.u32 %ff3_lanew, %ff3_offw;
+    cvt.u64.u32 %ff3_lanes, %ff3_offs;
+    cvt.u64.u32 %ff3_lanex, %ff3_offx;
+
+    shr.u32 %ff3_groups, %ff3_cols, 7;
+    mul.wide.u32 %ff3_stride, %ff3_groups, 136;
+
+    cvt.u64.u32 %ff3_row64, %ff3_row0;
+    mul.lo.u64 %ff3_roff, %ff3_stride, %ff3_row64;
+    add.u64 %sg_addr0, %ff3_gate, %ff3_roff;
+    add.u64 %su_addr0, %ff3_up, %ff3_roff;
+    add.u64 %wg_addr0, %sg_addr0, %ff3_lanew;
+    add.u64 %wu_addr0, %su_addr0, %ff3_lanew;
+    add.u64 %sg_addr0, %sg_addr0, %ff3_lanes;
+    add.u64 %su_addr0, %su_addr0, %ff3_lanes;
+
+    cvt.u64.u32 %ff3_row64, %ff3_row1;
+    mul.lo.u64 %ff3_roff, %ff3_stride, %ff3_row64;
+    add.u64 %sg_addr1, %ff3_gate, %ff3_roff;
+    add.u64 %su_addr1, %ff3_up, %ff3_roff;
+    add.u64 %wg_addr1, %sg_addr1, %ff3_lanew;
+    add.u64 %wu_addr1, %su_addr1, %ff3_lanew;
+    add.u64 %sg_addr1, %sg_addr1, %ff3_lanes;
+    add.u64 %su_addr1, %su_addr1, %ff3_lanes;
+    add.u64 %ff3_xaddr, %ff3_input, %ff3_lanex;
+
+    mov.f32 %sumg0, 0.0;
+    mov.f32 %sumu0, 0.0;
+    mov.f32 %sumg1, 0.0;
+    mov.f32 %sumu1, 0.0;
+    mov.u32 %wg1, 0;
+    mov.u32 %wu1, 0;
+    mov.u16 %hg1, 0;
+    mov.u16 %hu1, 0;
+    mov.u32 %ff3_g, 0;
+
+$L_loop_ffn_v3:
+    setp.ge.u32 %p_ff3_done, %ff3_g, %ff3_groups;
+    @%p_ff3_done bra $L_reduce_ffn_v3;
+
+    ld.global.cs.u16 %hg0, [%sg_addr0];
+    ld.global.cs.u16 %hu0, [%su_addr0];
+    @%p_ff3_row1 ld.global.cs.u16 %hg1, [%sg_addr1];
+    @%p_ff3_row1 ld.global.cs.u16 %hu1, [%su_addr1];
+    ld.global.cs.u32 %wg0, [%wg_addr0];
+    ld.global.cs.u32 %wu0, [%wu_addr0];
+    @%p_ff3_row1 ld.global.cs.u32 %wg1, [%wg_addr1];
+    @%p_ff3_row1 ld.global.cs.u32 %wu1, [%wu_addr1];
+    ld.global.v4.f32 {%ff3_x0, %ff3_x1, %ff3_x2, %ff3_x3}, [%ff3_xaddr];
+    cvt.f32.f16 %sg0, %hg0;
+    cvt.f32.f16 %su0, %hu0;
+    cvt.f32.f16 %sg1, %hg1;
+    cvt.f32.f16 %su1, %hu1;
+
+    add.u64 %sg_addr0, %sg_addr0, 136;
+    add.u64 %su_addr0, %su_addr0, 136;
+    add.u64 %wg_addr0, %wg_addr0, 136;
+    add.u64 %wu_addr0, %wu_addr0, 136;
+    add.u64 %sg_addr1, %sg_addr1, 136;
+    add.u64 %su_addr1, %su_addr1, 136;
+    add.u64 %wg_addr1, %wg_addr1, 136;
+    add.u64 %wu_addr1, %wu_addr1, 136;
+    add.u64 %ff3_xaddr, %ff3_xaddr, 512;
+
+    shl.b32 %eg0, %wg0, 24;
+    shr.s32 %eg0, %eg0, 24;
+    shl.b32 %eu0, %wu0, 24;
+    shr.s32 %eu0, %eu0, 24;
+    shl.b32 %eg1, %wg1, 24;
+    shr.s32 %eg1, %eg1, 24;
+    shl.b32 %eu1, %wu1, 24;
+    shr.s32 %eu1, %eu1, 24;
+    cvt.rn.f32.s32 %qg0, %eg0;
+    cvt.rn.f32.s32 %qu0, %eu0;
+    cvt.rn.f32.s32 %qg1, %eg1;
+    cvt.rn.f32.s32 %qu1, %eu1;
+    mul.f32 %qg0, %qg0, %sg0;
+    mul.f32 %qu0, %qu0, %su0;
+    mul.f32 %qg1, %qg1, %sg1;
+    mul.f32 %qu1, %qu1, %su1;
+    fma.rn.f32 %sumg0, %qg0, %ff3_x0, %sumg0;
+    fma.rn.f32 %sumu0, %qu0, %ff3_x0, %sumu0;
+    fma.rn.f32 %sumg1, %qg1, %ff3_x0, %sumg1;
+    fma.rn.f32 %sumu1, %qu1, %ff3_x0, %sumu1;
+
+    shl.b32 %eg0, %wg0, 16;
+    shr.s32 %eg0, %eg0, 24;
+    shl.b32 %eu0, %wu0, 16;
+    shr.s32 %eu0, %eu0, 24;
+    shl.b32 %eg1, %wg1, 16;
+    shr.s32 %eg1, %eg1, 24;
+    shl.b32 %eu1, %wu1, 16;
+    shr.s32 %eu1, %eu1, 24;
+    cvt.rn.f32.s32 %qg0, %eg0;
+    cvt.rn.f32.s32 %qu0, %eu0;
+    cvt.rn.f32.s32 %qg1, %eg1;
+    cvt.rn.f32.s32 %qu1, %eu1;
+    mul.f32 %qg0, %qg0, %sg0;
+    mul.f32 %qu0, %qu0, %su0;
+    mul.f32 %qg1, %qg1, %sg1;
+    mul.f32 %qu1, %qu1, %su1;
+    fma.rn.f32 %sumg0, %qg0, %ff3_x1, %sumg0;
+    fma.rn.f32 %sumu0, %qu0, %ff3_x1, %sumu0;
+    fma.rn.f32 %sumg1, %qg1, %ff3_x1, %sumg1;
+    fma.rn.f32 %sumu1, %qu1, %ff3_x1, %sumu1;
+
+    shl.b32 %eg0, %wg0, 8;
+    shr.s32 %eg0, %eg0, 24;
+    shl.b32 %eu0, %wu0, 8;
+    shr.s32 %eu0, %eu0, 24;
+    shl.b32 %eg1, %wg1, 8;
+    shr.s32 %eg1, %eg1, 24;
+    shl.b32 %eu1, %wu1, 8;
+    shr.s32 %eu1, %eu1, 24;
+    cvt.rn.f32.s32 %qg0, %eg0;
+    cvt.rn.f32.s32 %qu0, %eu0;
+    cvt.rn.f32.s32 %qg1, %eg1;
+    cvt.rn.f32.s32 %qu1, %eu1;
+    mul.f32 %qg0, %qg0, %sg0;
+    mul.f32 %qu0, %qu0, %su0;
+    mul.f32 %qg1, %qg1, %sg1;
+    mul.f32 %qu1, %qu1, %su1;
+    fma.rn.f32 %sumg0, %qg0, %ff3_x2, %sumg0;
+    fma.rn.f32 %sumu0, %qu0, %ff3_x2, %sumu0;
+    fma.rn.f32 %sumg1, %qg1, %ff3_x2, %sumg1;
+    fma.rn.f32 %sumu1, %qu1, %ff3_x2, %sumu1;
+
+    shr.s32 %eg0, %wg0, 24;
+    shr.s32 %eu0, %wu0, 24;
+    shr.s32 %eg1, %wg1, 24;
+    shr.s32 %eu1, %wu1, 24;
+    cvt.rn.f32.s32 %qg0, %eg0;
+    cvt.rn.f32.s32 %qu0, %eu0;
+    cvt.rn.f32.s32 %qg1, %eg1;
+    cvt.rn.f32.s32 %qu1, %eu1;
+    mul.f32 %qg0, %qg0, %sg0;
+    mul.f32 %qu0, %qu0, %su0;
+    mul.f32 %qg1, %qg1, %sg1;
+    mul.f32 %qu1, %qu1, %su1;
+    fma.rn.f32 %sumg0, %qg0, %ff3_x3, %sumg0;
+    fma.rn.f32 %sumu0, %qu0, %ff3_x3, %sumu0;
+    fma.rn.f32 %sumg1, %qg1, %ff3_x3, %sumg1;
+    fma.rn.f32 %sumu1, %qu1, %ff3_x3, %sumu1;
+
+    add.u32 %ff3_g, %ff3_g, 1;
+    bra $L_loop_ffn_v3;
+
+$L_reduce_ffn_v3:
+    shfl.sync.down.b32 %shg0, %sumg0, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu0, %sumu0, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shg1, %sumg1, 16, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu1, %sumu1, 16, 0x1f, 0xffffffff;
+    add.f32 %sumg0, %sumg0, %shg0;
+    add.f32 %sumu0, %sumu0, %shu0;
+    add.f32 %sumg1, %sumg1, %shg1;
+    add.f32 %sumu1, %sumu1, %shu1;
+    shfl.sync.down.b32 %shg0, %sumg0, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu0, %sumu0, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shg1, %sumg1, 8, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu1, %sumu1, 8, 0x1f, 0xffffffff;
+    add.f32 %sumg0, %sumg0, %shg0;
+    add.f32 %sumu0, %sumu0, %shu0;
+    add.f32 %sumg1, %sumg1, %shg1;
+    add.f32 %sumu1, %sumu1, %shu1;
+    shfl.sync.down.b32 %shg0, %sumg0, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu0, %sumu0, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shg1, %sumg1, 4, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu1, %sumu1, 4, 0x1f, 0xffffffff;
+    add.f32 %sumg0, %sumg0, %shg0;
+    add.f32 %sumu0, %sumu0, %shu0;
+    add.f32 %sumg1, %sumg1, %shg1;
+    add.f32 %sumu1, %sumu1, %shu1;
+    shfl.sync.down.b32 %shg0, %sumg0, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu0, %sumu0, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shg1, %sumg1, 2, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu1, %sumu1, 2, 0x1f, 0xffffffff;
+    add.f32 %sumg0, %sumg0, %shg0;
+    add.f32 %sumu0, %sumu0, %shu0;
+    add.f32 %sumg1, %sumg1, %shg1;
+    add.f32 %sumu1, %sumu1, %shu1;
+    shfl.sync.down.b32 %shg0, %sumg0, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu0, %sumu0, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shg1, %sumg1, 1, 0x1f, 0xffffffff;
+    shfl.sync.down.b32 %shu1, %sumu1, 1, 0x1f, 0xffffffff;
+    add.f32 %sumg0, %sumg0, %shg0;
+    add.f32 %sumu0, %sumu0, %shu0;
+    add.f32 %sumg1, %sumg1, %shg1;
+    add.f32 %sumu1, %sumu1, %shu1;
+
+    setp.eq.u32 %p_ff3_lane0, %ff3_lane, 0;
+    @!%p_ff3_lane0 ret;
+
+    neg.f32 %ff3_neg, %sumg0;
+    mul.f32 %ff3_log2e, %ff3_neg, 0f3fb8aa3b;
+    ex2.approx.f32 %ff3_exp, %ff3_log2e;
+    add.f32 %ff3_denom, %ff3_exp, 0f3f800000;
+    rcp.approx.f32 %ff3_sig, %ff3_denom;
+    mul.f32 %ff3_silu, %sumg0, %ff3_sig;
+    mul.f32 %ff3_fused, %ff3_silu, %sumu0;
+    mul.wide.u32 %ff3_outaddr, %ff3_row0, 4;
+    add.u64 %ff3_outaddr, %ff3_output, %ff3_outaddr;
+    st.global.f32 [%ff3_outaddr], %ff3_fused;
+
+    @!%p_ff3_row1 ret;
+    neg.f32 %ff3_neg, %sumg1;
+    mul.f32 %ff3_log2e, %ff3_neg, 0f3fb8aa3b;
+    ex2.approx.f32 %ff3_exp, %ff3_log2e;
+    add.f32 %ff3_denom, %ff3_exp, 0f3f800000;
+    rcp.approx.f32 %ff3_sig, %ff3_denom;
+    mul.f32 %ff3_silu, %sumg1, %ff3_sig;
+    mul.f32 %ff3_fused, %ff3_silu, %sumu1;
+    add.u64 %ff3_outaddr, %ff3_outaddr, 4;
+    st.global.f32 [%ff3_outaddr], %ff3_fused;
+    ret;
+}

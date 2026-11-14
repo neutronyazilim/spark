@@ -1,7 +1,8 @@
 use crate::{
     kernel::{
         gemv_q4_0, gemv_q4_0_parallel, gemv_q8_0, gemv_q8_0_parallel, pool::ThreadPool,
-        q4_0::BlockQ4_0, q8_0::BlockQ8_0, ternary::{gemv_ternary, BlockQ2_0}, GemvError,
+        q1_0::BlockQ1_0, q4_0::BlockQ4_0, q8_0::BlockQ8_0,
+        ternary::{gemv_ternary, BlockQ2_0}, GemvError,
     },
     loader::gguf::{GgufError, GgufModel, TensorInfo},
     profile::ProfileStats,
@@ -11,6 +12,37 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q8_0: u32 = 8;
 const GGML_TYPE_PTQ1_0: u32 = 143;
+const GGML_TYPE_Q1_0: u32 = 41;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Q1Matrix<'a> {
+    pub bytes: &'a [u8],
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl Q1Matrix<'_> {
+    pub fn blocks(&self) -> &[BlockQ1_0] {
+        let count = self.rows * self.cols / 128;
+        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), count) }
+    }
+
+    pub fn gemv_parallel(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        pool: &ThreadPool,
+        profile: Option<&mut ProfileStats>,
+    ) -> Result<(), GemvError> {
+        if input.len() != self.cols {
+            return Err(GemvError::ActivationLength { expected: self.cols, actual: input.len() });
+        }
+        let rows = self.rows.min(output.len());
+        let quantized = crate::kernel::q1_0::quantize_activations_q8_0(input);
+        pool.gemv_q1_0(self.blocks(), &quantized, &mut output[..rows], self.cols, profile);
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Q8Matrix<'a> {
@@ -132,6 +164,7 @@ impl PTQ1Matrix<'_> {
 
 #[derive(Debug, Clone, Copy)]
 pub enum QuantizedMatrix<'a> {
+    Q1(Q1Matrix<'a>),
     Q8(Q8Matrix<'a>),
     Q4(Q4Matrix<'a>),
     Ternary(TernaryMatrix<'a>),
@@ -141,6 +174,7 @@ pub enum QuantizedMatrix<'a> {
 impl<'a> QuantizedMatrix<'a> {
     pub fn rows(&self) -> usize {
         match self {
+            Self::Q1(m) => m.rows,
             Self::Q8(m) => m.rows,
             Self::Q4(m) => m.rows,
             Self::Ternary(m) => m.rows,
@@ -150,6 +184,7 @@ impl<'a> QuantizedMatrix<'a> {
 
     pub fn cols(&self) -> usize {
         match self {
+            Self::Q1(m) => m.cols,
             Self::Q8(m) => m.cols,
             Self::Q4(m) => m.cols,
             Self::Ternary(m) => m.cols,
@@ -159,6 +194,7 @@ impl<'a> QuantizedMatrix<'a> {
 
     pub fn raw_bytes(&self) -> &'a [u8] {
         match self {
+            Self::Q1(m) => m.bytes,
             Self::Q8(m) => m.bytes,
             Self::Q4(m) => m.bytes,
             Self::Ternary(m) => m.bytes,
@@ -168,6 +204,10 @@ impl<'a> QuantizedMatrix<'a> {
 
     pub fn is_q4(&self) -> bool {
         matches!(self, Self::Q4(_))
+    }
+
+    pub fn is_q1(&self) -> bool {
+        matches!(self, Self::Q1(_))
     }
 
     pub fn is_ternary(&self) -> bool {
@@ -182,6 +222,7 @@ impl<'a> QuantizedMatrix<'a> {
         profile: Option<&mut ProfileStats>,
     ) -> Result<(), GemvError> {
         match self {
+            Self::Q1(m) => m.gemv_parallel(input, output, pool, profile),
             Self::Q8(m) => m.gemv_parallel(input, output, pool, profile),
             Self::Q4(m) => m.gemv_parallel(input, output, pool, profile),
             Self::Ternary(m) => m.gemv_parallel(input, output, pool, profile),
@@ -200,6 +241,52 @@ impl F32Vector<'_> {
     pub fn values(&self) -> &[f32] {
         unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.len) }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct F32Matrix<'a> {
+    bytes: &'a [u8],
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl F32Matrix<'_> {
+    pub fn values(&self) -> &[f32] {
+        unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.rows * self.cols) }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Qwen35AttentionWeights<'a> {
+    Full {
+        q: QuantizedMatrix<'a>,
+        k: QuantizedMatrix<'a>,
+        v: QuantizedMatrix<'a>,
+        output: QuantizedMatrix<'a>,
+        q_norm: F32Vector<'a>,
+        k_norm: F32Vector<'a>,
+    },
+    Recurrent {
+        qkv: QuantizedMatrix<'a>,
+        z: QuantizedMatrix<'a>,
+        alpha: QuantizedMatrix<'a>,
+        beta: QuantizedMatrix<'a>,
+        conv1d: F32Matrix<'a>,
+        dt_bias: F32Vector<'a>,
+        a: F32Vector<'a>,
+        state_norm: F32Vector<'a>,
+        output: QuantizedMatrix<'a>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Qwen35LayerWeights<'a> {
+    pub attn_norm: F32Vector<'a>,
+    pub post_attention_norm: F32Vector<'a>,
+    pub attention: Qwen35AttentionWeights<'a>,
+    pub gate: QuantizedMatrix<'a>,
+    pub up: QuantizedMatrix<'a>,
+    pub down: QuantizedMatrix<'a>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -307,6 +394,7 @@ pub struct ModelWeights<'a> {
     pub output: QuantizedMatrix<'a>,
     pub final_norm: F32Vector<'a>,
     pub layers: Vec<LayerWeights<'a>>,
+    pub qwen35_layers: Vec<Qwen35LayerWeights<'a>>,
 }
 
 impl<'a> ModelWeights<'a> {
@@ -317,6 +405,65 @@ impl<'a> ModelWeights<'a> {
             find_tensor(model, &["output.weight", "token_embd.weight"])?,
         )?;
         let final_norm = vector(model, find_tensor(model, &["output_norm.weight", "norm.weight"])?)?;
+
+        if model
+            .metadata_value("general.architecture")
+            .and_then(|value| value.as_str())
+            == Some("qwen35")
+        {
+            let mut qwen35_layers = Vec::with_capacity(layers);
+            for layer in 0..layers {
+                let prefix = format!("blk.{layer}.");
+                let attn_norm = vector(
+                    model,
+                    required_prefixed(model, &prefix, &["attn_norm.weight"])?
+                )?;
+                let post_attention_norm = vector(
+                    model,
+                    required_prefixed(model, &prefix, &["post_attention_norm.weight"])?
+                )?;
+
+                let attention = if model.tensor(&format!("{prefix}ssm_out.weight")).is_some() {
+                    Qwen35AttentionWeights::Recurrent {
+                        qkv: matrix(model, required_prefixed(model, &prefix, &["attn_qkv.weight"])?)?,
+                        z: matrix(model, required_prefixed(model, &prefix, &["attn_gate.weight"])?)?,
+                        alpha: matrix(model, required_prefixed(model, &prefix, &["ssm_alpha.weight"])?)?,
+                        beta: matrix(model, required_prefixed(model, &prefix, &["ssm_beta.weight"])?)?,
+                        conv1d: f32_matrix(model, required_prefixed(model, &prefix, &["ssm_conv1d.weight"])?)?,
+                        dt_bias: vector(model, required_prefixed(model, &prefix, &["ssm_dt.bias"])?)?,
+                        a: vector(model, required_prefixed(model, &prefix, &["ssm_a"])?)?,
+                        state_norm: vector(model, required_prefixed(model, &prefix, &["ssm_norm.weight"])?)?,
+                        output: matrix(model, required_prefixed(model, &prefix, &["ssm_out.weight"])?)?,
+                    }
+                } else {
+                    Qwen35AttentionWeights::Full {
+                        q: matrix(model, required_prefixed(model, &prefix, &["attn_q.weight"])?)?,
+                        k: matrix(model, required_prefixed(model, &prefix, &["attn_k.weight"])?)?,
+                        v: matrix(model, required_prefixed(model, &prefix, &["attn_v.weight"])?)?,
+                        output: matrix(model, required_prefixed(model, &prefix, &["attn_output.weight"])?)?,
+                        q_norm: vector(model, required_prefixed(model, &prefix, &["attn_q_norm.weight"])?)?,
+                        k_norm: vector(model, required_prefixed(model, &prefix, &["attn_k_norm.weight"])?)?,
+                    }
+                };
+
+                qwen35_layers.push(Qwen35LayerWeights {
+                    attn_norm,
+                    post_attention_norm,
+                    attention,
+                    gate: matrix(model, required_prefixed(model, &prefix, &["ffn_gate.weight"])?)?,
+                    up: matrix(model, required_prefixed(model, &prefix, &["ffn_up.weight"])?)?,
+                    down: matrix(model, required_prefixed(model, &prefix, &["ffn_down.weight"])?)?,
+                });
+            }
+
+            return Ok(Self {
+                token_embedding,
+                output,
+                final_norm,
+                layers: Vec::new(),
+                qwen35_layers,
+            });
+        }
 
         let mut layer_weights = Vec::with_capacity(layers);
         for layer in 0..layers {
@@ -391,6 +538,7 @@ impl<'a> ModelWeights<'a> {
             output,
             final_norm,
             layers: layer_weights,
+            qwen35_layers: Vec::new(),
         })
     }
 }
@@ -453,6 +601,16 @@ fn matrix<'a>(
     }
 
     match tensor.ggml_type {
+        GGML_TYPE_Q1_0 => {
+            if !cols.is_multiple_of(128) {
+                return Err(GgufError::InvalidFormat(format!(
+                    "tensor {} Q1_0 columns are not a multiple of 128",
+                    tensor.name
+                )));
+            }
+            let bytes = model.tensor_bytes(tensor, rows * cols / 128 * BlockQ1_0::BYTE_SIZE)?;
+            Ok(QuantizedMatrix::Q1(Q1Matrix { bytes, rows, cols }))
+        }
         GGML_TYPE_Q8_0 => {
             let bytes = model.tensor_bytes(tensor, rows * cols / 32 * BlockQ8_0::BYTE_SIZE)?;
             Ok(QuantizedMatrix::Q8(Q8Matrix { bytes, rows, cols }))
@@ -492,4 +650,22 @@ fn vector<'a>(
         .map_err(|_| GgufError::CountTooLarge("tensor dimension", tensor.dimensions[0]))?;
     let bytes = model.tensor_bytes(tensor, len * std::mem::size_of::<f32>())?;
     Ok(F32Vector { bytes, len })
+}
+
+fn f32_matrix<'a>(
+    model: &'a GgufModel<'a>,
+    tensor: &TensorInfo<'a>,
+) -> Result<F32Matrix<'a>, GgufError> {
+    if tensor.ggml_type != GGML_TYPE_F32 || tensor.dimensions.len() != 2 {
+        return Err(GgufError::InvalidFormat(format!(
+            "tensor {} must be a rank-2 F32 matrix",
+            tensor.name
+        )));
+    }
+    let cols = usize::try_from(tensor.dimensions[0])
+        .map_err(|_| GgufError::CountTooLarge("tensor dimension", tensor.dimensions[0]))?;
+    let rows = usize::try_from(tensor.dimensions[1])
+        .map_err(|_| GgufError::CountTooLarge("tensor dimension", tensor.dimensions[1]))?;
+    let bytes = model.tensor_bytes(tensor, rows * cols * std::mem::size_of::<f32>())?;
+    Ok(F32Matrix { bytes, rows, cols })
 }

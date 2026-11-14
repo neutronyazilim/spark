@@ -46,7 +46,11 @@ pub fn run(
             continue;
         }
 
-        let prompt = format!("<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n");
+        let prompt = if session.transformer.config.is_qwen35 {
+            format!("<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n<think>\n")
+        } else {
+            format!("<|im_start|>user\n{input}<|im_end|>\n<|im_start|>assistant\n")
+        };
         let tokens = session.tokenizer.encode(
             &prompt,
             session.position == 0 && session.tokenizer.should_add_bos(),

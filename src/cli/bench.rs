@@ -12,7 +12,11 @@ pub fn run(
     max_tokens: usize,
     profile: bool,
 ) -> Result<(), GgufError> {
-    let prompt = "<|im_start|>user\nBenchmark a short response.<|im_end|>\n<|im_start|>assistant\n";
+    let prompt = if session.transformer.config.is_qwen35 {
+        "<|im_start|>user\nBenchmark a short response.<|im_end|>\n<|im_start|>assistant\n<think>\n"
+    } else {
+        "<|im_start|>user\nBenchmark a short response.<|im_end|>\n<|im_start|>assistant\n"
+    };
     let tokens = session
         .tokenizer
         .encode(prompt, session.tokenizer.should_add_bos());

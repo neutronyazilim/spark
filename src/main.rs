@@ -224,12 +224,23 @@ fn run_once(
 ) -> Result<(), GgufError> {
     let formatted = if raw {
         prompt.to_string()
+    } else if session.transformer.config.is_qwen35 {
+        format!(
+            "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
     } else {
         format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n")
     };
     let tokens = session
         .tokenizer
         .encode(&formatted, session.tokenizer.should_add_bos() && !raw);
+    if std::env::var_os("SPARK_DEBUG_TOKENS").is_some() {
+        eprintln!("FORMATTED: {formatted:?}");
+        eprintln!("TOKENS: {tokens:?}");
+        for (i, t) in tokens.iter().enumerate() {
+            eprintln!("  [{i}] id={t} -> {:?}", session.tokenizer.decode_token(*t));
+        }
+    }
     if tokens.is_empty() {
         return Err(invalid("prompt produced no tokens"));
     }

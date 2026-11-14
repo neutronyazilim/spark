@@ -2,7 +2,7 @@
 
 `spark`, harici ağır ML kütüphaneleri kullanmadan yazılan, CPU-first + CUDA destekli Rust LLM inference motorudur.
 
-Proje şu anda GGUF model yükleme, Q8_0/Q4_0 quantized ve ternary (Q2_0 / BitNet PTQ1_0) GEMV kernel'leri, CUDA GPU acceleration, Qwen2.5 transformer forward pass'i, KV-cache, GGUF içinden BPE tokenizer ve temel autoregressive text generation desteğine sahiptir.
+Proje şu anda GGUF model yükleme, Q8_0/Q4_0/Q1_0 ve ternary GEMV kernel'leri, CUDA GPU acceleration, Qwen2.5 ile hibrit-attention Qwen3.5 forward pass'leri, KV/recurrent cache, GGUF içinden BPE tokenizer ve autoregressive text generation desteğine sahiptir.
 
 ## Özellikler
 
@@ -12,16 +12,22 @@ Proje şu anda GGUF model yükleme, Q8_0/Q4_0 quantized ve ternary (Q2_0 / BitNe
 - Ternary (BitNet tarzı) ağırlık desteği:
   - Q2_0 / 2-bit ternary blok formatı (32 ağırlık / 10 bayt)
   - Prism ML / BitNet PTQ1_0 formatı (128 ağırlık / 28 bayt, 1.75 bpw)
+- GGML Q1_0 bipolar formatı (128 ağırlık / 18 bayt, 1.125 bpw)
 - Scalar, AVX ve AVX2/FMA GEMV kernel'leri
 - Runtime CPU feature dispatch
 - CUDA backend (harici kütüphane olmadan, `dlopen` ile CUDA Driver API):
   - `kernels/gemv.ptx` içindeki elle yazılmış PTX kernel'ları runtime'da yüklenir
-  - Q8_0/Q4_0/PTQ1_0 GEMV, fused QKV ve fused FFN (gate+up+SwiGLU) kernel'ları
+  - Q8_0/Q4_0/Q1_0/PTQ1_0 GEMV, fused QKV ve fused FFN kernel'ları
+  - Q1_0 için Q8 aktivasyon + `dp4a`, çoklu projection batching ve iki-row/warp kernel
   - GPU üzerinde argmax ve top-64 sampling
   - Hibrit katman offloading (`-ngl/--gpu-layers`): VRAM'e sığan katman sayısı otomatik hesaplanır, kalan katmanlar CPU'da çalışır
   - `SPARK_NO_CUDA=1` ile devre dışı bırakılabilir; CUDA başlatılamazsa otomatik CPU'ya düşer
 - Arena tabanlı scratch buffer
 - Qwen2/Qwen2.5 transformer blokları
+- Qwen3.5/Qwen35 hibrit mimarisi:
+  - 4-tap causal convolution + Gated DeltaNet recurrent katmanları
+  - Gated full attention, head-wise Q/K RMSNorm ve text MRoPE
+  - Ayrı KV-cache ve recurrent-state cache
 - Q/K/V bias destekli attention
 - Grouped Query Attention (GQA)
 - RoPE, RMSNorm, Softmax ve SwiGLU
@@ -37,7 +43,7 @@ Proje şu anda GGUF model yükleme, Q8_0/Q4_0 quantized ve ternary (Q2_0 / BitNe
 - Rust stable toolchain
 - x86-64 CPU önerilir
 - AVX/AVX2 destekli CPU'larda SIMD kernel'leri otomatik seçilir
-- GGUF formatında Qwen2/Qwen2.5 modeli
+- GGUF formatında Qwen2/Qwen2.5 veya Qwen3.5/Qwen35 modeli
 - CUDA desteği için: NVIDIA GPU + kurulu sürücü (`libcuda.so.1`); ayrıca CUDA Toolkit gerekmez (PTX runtime'da JIT derlenir)
 
 ## Derleme
@@ -70,6 +76,17 @@ CUDA GPU ile (hibrit katman offloading otomatik):
 - VRAM'e sığan katmanlar GPU'ya yüklenir, kalanlar CPU'da çalışır.
 - `-ngl/--gpu-layers N` ile offload edilecek katman sayısı elle belirtilebilir.
 - `SPARK_NO_CUDA=1` CUDA'yı tamamen devre dışı bırakır.
+
+Qwen3.5 27B Q1_0 örneği:
+
+```bash
+./target/release/spark run ./Bonsai-27B-Q1_0.gguf \
+  -p "Merhaba" -n 64 --temp 0 --threads 8
+```
+
+Q1_0 modelde katman bütçesi ve LM head VRAM'e göre otomatik seçilir. Örneğin
+4 GB RTX 3050 üzerinde 59/64 katman ile output projection birlikte GPU'da
+çalışabilir; kalan recurrent/transformer işlemleri CPU thread pool'da devam eder.
 
 Derlenmiş binary ile:
 
@@ -170,7 +187,7 @@ CUDA backend?                    CPU backend
    |    top-64 sampling)            |
    |                                |
    v                                v
-Qwen2 transformer (hibrit: GPU katmanları + CPU katmanları)
+Qwen2 veya Qwen35 transformer (hibrit: GPU katmanları + CPU/recurrent işlemler)
    |
    +--> RMSNorm
    +--> Q/K/V projections
@@ -207,18 +224,21 @@ cargo bench --bench gemv
 
 ## Mevcut kapsam ve sınırlamalar
 
-- Ana hedef Qwen2/Qwen2.5 Q8_0 modelidir; ternary (Q2_0 / PTQ1_0) ağırlıklı modeller de desteklenir.
+- Qwen2/Qwen2.5 Q8_0 ve Qwen35 Q1_0 yolları end-to-end doğrulanmıştır; Q2_0/PTQ1_0 CUDA GEMV'leri sentetik CPU referans testlerine sahiptir.
 - Tokenizer, GGUF içindeki vocab ve merge metadata'sını kullanır.
 - Qwen2.5 Instruct için prompt otomatik olarak ChatML formatına sarılır:
   `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
+- Qwen35 için model template'inin generation eki (`<think>\n`) ve GGUF control
+  token tipleri otomatik uygulanır.
 - `spark chat` oturumu KV-cache'i turlar arasında korur ve yanıtları ANSI
   renkleriyle akış halinde yazdırır.
 - Forward pass arena kullanır; tokenizer encode/decode ve temperature sampling tarafında normal Rust `Vec` kullanımı devam eder.
 - Model yükleme sırasında metadata, tensor tanımları ve layer weight binding tabloları oluşturulur.
 - CUDA: sürücü (`libcuda.so.1`) + NVIDIA GPU gerekir, CUDA Toolkit gerekmez.
   PTX modülü runtime'da yüklenir; başlatma başarısız olursa sessizce CPU'ya düşülür.
-- GPU'ya yüklenen katmanlarda attention/RoPE/KV-cache CPU ile ortak akışta işlenir;
-  yalnızca GEMV ve sampling CUDA kernel'larına gider.
+- Qwen35 Q1_0 offload yolu aynı aktivasyonu kullanan projection'ları tek H2D/D2H
+  turunda batch eder. Recurrent state varsayılan olarak bit-kararlı CPU yolunda
+  tutulur; deneysel GPU Gated DeltaNet `SPARK_GDN_CUDA=1` ile açılabilir.
 - GEMV worker thread'leri model başlangıcında bir kez oluşturulur; token
   üretimi sırasında yeni thread spawn edilmez.
 - Metal ve harici ONNX/PyTorch/Candle entegrasyonu yoktur.

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    backend::{cuda::CudaModelWeights, CudaDevice, CudaEngine},
+    backend::{cuda::{CudaModelWeights, CudaQwen35Weights}, CudaDevice, CudaEngine, CudaQwen35Engine},
     kernel::pool::ThreadPool,
     loader::gguf::{GgufError, GgufModel},
     memory::arena::Arena,
@@ -37,30 +37,90 @@ impl<'a> InferenceSession<'a> {
         let weights = ModelWeights::from_gguf(model, config.layers)?;
         let pool =
             ThreadPool::new(threads).map_err(|message| GgufError::InvalidFormat(message.into()))?;
-        let cache = KvCache::new(
-            config.layers,
-            config.context_len,
-            config.kv_heads,
-            config.head_dim,
-        )
+        let cache = if config.is_qwen35 {
+            let conv_channels = config.ssm_inner_size
+                + 2 * config.ssm_group_count * config.ssm_state_size;
+            let value_head_dim = config.ssm_inner_size / config.ssm_time_step_rank.max(1);
+            KvCache::new_qwen35(
+                config.layers,
+                config.context_len,
+                config.kv_heads,
+                config.head_dim,
+                config.full_attention_interval,
+                config.ssm_conv_kernel,
+                conv_channels,
+                config.ssm_time_step_rank,
+                value_head_dim,
+            )
+        } else {
+            KvCache::new(
+                config.layers,
+                config.context_len,
+                config.kv_heads,
+                config.head_dim,
+            )
+        }
         .map_err(|message| GgufError::InvalidFormat(message.into()))?;
-        let max_qkv = weights.layers.iter().map(|l| l.q.rows()).max().unwrap_or(config.heads * config.head_dim);
-        let max_ctx = weights.layers.iter().map(|l| l.o.cols()).max().unwrap_or(config.heads * config.head_dim);
+        let max_qkv = if config.is_qwen35 {
+            (config.heads * config.head_dim * 2).max(
+                config.ssm_inner_size + 2 * config.ssm_group_count * config.ssm_state_size,
+            )
+        } else {
+            weights.layers.iter().map(|l| l.q.rows()).max().unwrap_or(config.heads * config.head_dim)
+        };
+        let max_ctx = if config.is_qwen35 {
+            (config.heads * config.head_dim).max(config.ssm_inner_size)
+        } else {
+            weights.layers.iter().map(|l| l.o.cols()).max().unwrap_or(config.heads * config.head_dim)
+        };
         let max_inter = weights.layers.iter().map(|l| l.gate.rows().max(l.down.cols())).max().unwrap_or(config.intermediate_dim);
         let max_vocab = weights.output.rows().max(config.vocab_size);
 
-        let scratch_floats = max_vocab
-            + config.hidden_dim * 4
-            + max_qkv * 2
-            + max_ctx * 2
-            + config.kv_heads * config.head_dim * 2
-            + config.context_len
-            + max_inter * 2;
+        let scratch_floats = if config.is_qwen35 {
+            let key_dim = config.ssm_group_count * config.ssm_state_size;
+            max_vocab
+                + config.hidden_dim * 3
+                + max_qkv * 2
+                + config.heads * config.head_dim * 2
+                + key_dim.max(config.kv_heads * config.head_dim)
+                + config.ssm_inner_size * 3
+                + config.ssm_time_step_rank * 2
+                + config.context_len
+                + max_inter * 2
+        } else {
+            max_vocab
+                + config.hidden_dim * 4
+                + max_qkv * 2
+                + max_ctx * 2
+                + config.kv_heads * config.head_dim * 2
+                + config.context_len
+                + max_inter * 2
+        };
 
-        let cuda = if let Some(device) = CudaDevice::init() {
+        let (cuda, qwen35_cuda) = if config.is_qwen35 {
+            let qwen_cuda = if let Some(device) = CudaDevice::init() {
+                let dev_name = device.name.clone();
+                let dev_arc = Arc::new(device);
+                match CudaQwen35Weights::upload(Arc::clone(&dev_arc), &weights, gpu_layers)
+                    .and_then(|cuda_weights| CudaQwen35Engine::new(dev_arc, cuda_weights))
+                {
+                    Ok(engine) => {
+                        println!("\x1b[32m[spark] Qwen35 GPU Acceleration Active: {dev_name}\x1b[0m");
+                        Some(engine)
+                    }
+                    Err(error) => {
+                        eprintln!("\x1b[33m[spark] Qwen35 CUDA init failed ({error}), using CPU\x1b[0m");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            (None, qwen_cuda)
+        } else if let Some(device) = CudaDevice::init() {
             let dev_name = device.name.clone();
             let dev_arc = Arc::new(device);
-            match CudaModelWeights::upload(Arc::clone(&dev_arc), &weights, &config, gpu_layers) {
+            let normal_cuda = match CudaModelWeights::upload(Arc::clone(&dev_arc), &weights, &config, gpu_layers) {
                 Ok(cuda_weights) => match CudaEngine::new(dev_arc, cuda_weights, &config) {
                     Ok(engine) => {
                         println!("\x1b[32m[spark] GPU Acceleration Active: {}\x1b[0m", dev_name);
@@ -75,9 +135,10 @@ impl<'a> InferenceSession<'a> {
                     eprintln!("\x1b[33m[spark] CUDA Weight upload failed ({}), falling back to CPU\x1b[0m", e);
                     None
                 }
-            }
+            };
+            (normal_cuda, None)
         } else {
-            None
+            (None, None)
         };
 
         Ok(Self {
@@ -87,6 +148,7 @@ impl<'a> InferenceSession<'a> {
                 weights,
                 pool,
                 cuda,
+                qwen35_cuda,
             },
             cache,
             arena: Arena::new(scratch_floats * std::mem::size_of::<f32>()),
@@ -107,6 +169,9 @@ impl<'a> InferenceSession<'a> {
 
     pub fn reset(&mut self) {
         self.cache.clear();
+        if let Some(cuda) = &self.transformer.qwen35_cuda {
+            let _ = cuda.clear_recurrent_state();
+        }
         self.position = 0;
         self.logits = None;
         self.last_token = None;
@@ -175,7 +240,7 @@ impl<'a> InferenceSession<'a> {
             self.logits = None; // consumed initial prefill logits
             t
         } else if let Some(prev) = self.last_token {
-            if self.transformer.cuda.is_some() {
+            if self.transformer.cuda.as_ref().is_some_and(|c| c.resident) {
                 let profiler = self.profile.as_mut();
                 self.transformer
                     .forward_token_and_sample(

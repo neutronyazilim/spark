@@ -3,6 +3,7 @@ pub mod avx2;
 pub mod f16;
 pub mod fallback;
 pub mod pool;
+pub mod q1_0;
 pub mod q4_0;
 pub mod q8_0;
 pub mod ternary;

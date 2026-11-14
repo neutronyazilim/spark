@@ -9,6 +9,7 @@ pub struct BpeTokenizer {
     bos_token: Option<u32>,
     eos_token: Option<u32>,
     add_bos_token: bool,
+    special_tokens: Vec<(String, u32)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -51,8 +52,24 @@ impl BpeTokenizer {
                 Some((left.to_owned(), right.to_owned()))
             })
             .collect();
+        let vocab: Vec<String> = tokens.into_iter().map(str::to_owned).collect();
+        let token_types = model
+            .metadata_value("tokenizer.ggml.token_type")
+            .and_then(|value| value.array_u32())
+            .unwrap_or_default();
+        let mut special_tokens: Vec<(String, u32)> = vocab
+            .iter()
+            .enumerate()
+            .filter(|(index, token)| {
+                matches!(token_types.get(*index), Some(3 | 4))
+                    || (token.starts_with("<|") && token.ends_with("|>"))
+                    || matches!(token.as_str(), "<think>" | "</think>")
+            })
+            .map(|(index, token)| (token.clone(), index as u32))
+            .collect();
+        special_tokens.sort_unstable_by_key(|token| std::cmp::Reverse(token.0.len()));
         Ok(Self {
-            vocab: tokens.into_iter().map(str::to_owned).collect(),
+            vocab,
             merges,
             bos_token: metadata_id(model, "tokenizer.ggml.bos_token_id"),
             eos_token: metadata_id(model, "tokenizer.ggml.eos_token_id"),
@@ -60,6 +77,7 @@ impl BpeTokenizer {
                 .metadata_value("tokenizer.ggml.add_bos_token")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false),
+            special_tokens,
         })
     }
 
@@ -84,7 +102,6 @@ impl BpeTokenizer {
     }
 
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
-        let special_tokens = ["<|im_start|>", "<|im_end|>"];
         let mut ids = Vec::new();
         if add_bos {
             if let Some(bos) = self.bos_token {
@@ -94,22 +111,22 @@ impl BpeTokenizer {
 
         let mut remaining = text;
         while !remaining.is_empty() {
-            let next_special = special_tokens
+            let next_special = self.special_tokens
                 .iter()
-                .filter_map(|special| remaining.find(special).map(|index| (index, *special)))
-                .min_by_key(|(index, _)| *index);
-            let Some((index, special)) = next_special else {
+                .filter_map(|(special, id)| {
+                    remaining
+                        .find(special)
+                        .map(|index| (index, special.as_str(), *id))
+                })
+                .min_by_key(|(index, _, _)| *index);
+            let Some((index, special, special_id)) = next_special else {
                 ids.extend(self.encode_text(remaining));
                 break;
             };
             if index != 0 {
                 ids.extend(self.encode_text(&remaining[..index]));
             }
-            if let Some(id) = self.vocab.iter().position(|vocab| vocab == special) {
-                ids.push(id as u32);
-            } else {
-                ids.extend(self.encode_text(special));
-            }
+            ids.push(special_id);
             remaining = &remaining[index + special.len()..];
         }
         ids
@@ -281,14 +298,21 @@ mod tests {
                 "e".into(),
                 "r".into(),
                 "\n".into(),
+                "<think>".into(),
             ],
             merges: Vec::new(),
             bos_token: None,
             eos_token: None,
             add_bos_token: false,
+            special_tokens: vec![
+                ("<|im_start|>".into(), 0),
+                ("<|im_end|>".into(), 1),
+                ("<think>".into(), 7),
+            ],
         };
         assert_eq!(tokenizer.encode("<|im_start|>user", false)[0], 0);
         assert_eq!(tokenizer.encode("<|im_end|>", false), vec![1]);
+        assert_eq!(tokenizer.encode("<think>\n", false)[0], 7);
         assert!(tokenizer.is_stop_token(1));
     }
 
@@ -300,6 +324,7 @@ mod tests {
             bos_token: None,
             eos_token: None,
             add_bos_token: false,
+            special_tokens: Vec::new(),
         };
         assert!(tokenizer.is_stop_token(QWEN_IM_END_TOKEN_ID));
     }
