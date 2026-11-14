@@ -55,6 +55,29 @@ The project currently supports GGUF model loading, Q8_0/Q4_0/Q1_0 and ternary GE
 cargo build --release
 ```
 
+### Installer script
+
+To build Spark from the current checkout and install it for the current user:
+
+```bash
+./install.sh
+```
+
+By default, the script installs the binary as `~/.local/bin/spark`. If that
+directory is not already on `PATH`, it adds it to the current user's Bash, Zsh,
+Fish, or POSIX shell profile. Restart the shell after installation to apply the
+change.
+
+For a system-wide installation under `/usr/local/bin`:
+
+```bash
+./install.sh --system
+```
+
+Only the final installation step uses `sudo` when administrator access is
+required; the Rust build still runs as the current user. Run
+`./install.sh --help` to see custom prefix and PATH options.
+
 ## Usage
 
 Run a prompt with a Qwen2.5 GGUF model:

@@ -53,6 +53,29 @@ Proje şu anda GGUF model yükleme, Q8_0/Q4_0/Q1_0 ve ternary GEMV kernel'leri, 
 cargo build --release
 ```
 
+### Kurulum betiği
+
+Spark'ı mevcut checkout'tan derleyip geçerli kullanıcı için kurmak üzere:
+
+```bash
+./install.sh
+```
+
+Betik varsayılan olarak binary'yi `~/.local/bin/spark` yoluna kurar. Bu dizin
+henüz `PATH` içinde değilse geçerli kullanıcının Bash, Zsh, Fish veya POSIX shell
+profiline ekler. Değişikliği uygulamak için kurulumdan sonra shell'i yeniden
+başlatın.
+
+`/usr/local/bin` altına sistem genelinde kurulum için:
+
+```bash
+./install.sh --system
+```
+
+Yönetici erişimi gerektiğinde yalnızca son kurulum adımı `sudo` kullanır; Rust
+derlemesi geçerli kullanıcıyla çalışmaya devam eder. Özel prefix ve PATH
+seçenekleri için `./install.sh --help` komutunu çalıştırın.
+
 ## Kullanım
 
 Qwen2.5 GGUF modeliyle prompt çalıştırma:
