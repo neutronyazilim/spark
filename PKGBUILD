@@ -1,3 +1,4 @@
+# Maintainer: naevui <deniz@neutronyazilim.com.tr>
 pkgname=spark-llm-git
 _pkgname=spark
 pkgver=0.1.0.r5.g273fe8e
@@ -6,9 +7,13 @@ pkgdesc='GGUF LLM inference engine with automatic CUDA acceleration and CPU fall
 arch=('x86_64')
 url='https://github.com/neutronyazilim/spark'
 license=('MIT')
-depends=('glibc' 'libgcc')
+depends=('gcc-libs')
 makedepends=('cargo' 'git')
-provides=("spark-llm=${pkgver}")
+optdepends=(
+  'nvidia-utils: NVIDIA GPU acceleration'
+  'cuda: CUDA runtime support'
+)
+provides=('spark-llm')
 conflicts=('spark' 'spark-llm')
 source=("${_pkgname}::git+${url}.git")
 sha256sums=('SKIP')
